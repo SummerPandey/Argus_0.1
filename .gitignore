@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Vendored camera-mode dependencies (installed by install-camera-deps.sh,
+# ~450MB+ - never meant to be committed)
+handwash-next/.deps/
+
+# Runtime state: startup/crash log and matplotlib cache, not source.
+# (No session or detection data is written anywhere - see nanoowl_logic.py.)
+handwash-next/logs/
+handwash-next/.cache/
+
+# Personal on-device calibration - keep config.example.json as the
+# checked-in template, but not the tuned values for one specific camera/sink.
+handwash-next/config.json
+
+# Editor / OS cruft
+*.swp
+*.swo
+.DS_Store
+
+# Local backups made by hand during editing
+*.backup-*
+
+# Local Claude Code instructions - not meant to be published with the repo
+CLAUDE.md

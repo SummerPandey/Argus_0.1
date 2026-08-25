@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Argus
+Comment=AI-powered surgical safety monitoring
+Exec=/home/nvidia/handwash-monitor/handwash-next/launch.sh
+Icon=/home/nvidia/handwash-monitor/handwash-next/assets/argus-icon.png
+Terminal=false
+Categories=Utility;
+StartupNotify=true
