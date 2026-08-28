@@ -93,24 +93,45 @@ cleanliness, so the display reports observed steps rather than claiming that
 hands are sterile or that the product is WHO-certified.
 
 In Room hand test, the display runs independently from a 15 FPS, 448-pixel
-inference worker, so landmark processing cannot stall the camera window. The
-Real sink test currently runs NanoOWL inference synchronously in the capture
-loop, so its frame rate still tracks TensorRT inference latency directly —
-**this is the ceiling on how smooth it can feel**, and it's not fixed here.
-Threading that inference call the way Room mode does would need a dedicated
-worker thread owning NanoOWL's CUDA/TensorRT context, which is easy to get
-subtly wrong (crashes, not just slowness) and impossible to verify without
-the actual Jetson + camera + NanoOWL engine this repo doesn't have access to
-in a plain dev environment — so it was deliberately left alone rather than
-guessed at. What *was* tightened, safely, with no such risk: the camera now
-requests a fixed 640×480 resolution and a 1-frame driver buffer
-(`CAP_PROP_BUFFERSIZE`), so `camera.read()` always returns the newest frame
-instead of one from a growing backlog, and every per-frame cost (color
-conversion, PIL conversion, NanoOWL preprocessing) scales with a sane frame
-size instead of whatever high-res default the camera driver picks. Startup
-failures are shown in a dialog and recorded in `logs/argus.log`; the sink
-test also always releases the camera and closes its window on exit, even if
-NanoOWL raises mid-session.
+inference worker, so landmark processing cannot stall the camera window.
+The Real sink test now applies the same pattern: NanoOWL inference runs on
+a single dedicated worker thread (`AsyncOwlPredictor` in
+`nanoowl_monitor.py`) instead of blocking the capture loop, so the camera
+window and key handling stay responsive at the camera's own rate instead
+of tracking TensorRT inference latency frame-for-frame. The checklist and
+detection boxes lag a frame or two behind the live video when inference is
+slower than capture — the same tradeoff Room mode already makes for
+MediaPipe — and stale frames are dropped rather than queued, so a slow
+inference cycle never builds a backlog.
+
+This was previously left synchronous on purpose: threading NanoOWL's
+`predict()` call means a worker thread that owns its CUDA/TensorRT
+context, which is easy to get subtly wrong (crashes, not just slowness),
+and this repo doesn't have access to the Jetson + camera + NanoOWL engine
+needed to run it for real. `AsyncOwlPredictor` keeps the one rule that
+matters explicit and enforced by construction — exactly one thread is ever
+created, and it is the only thread that ever calls `predict()` — and the
+decision logic in `nanoowl_logic.py` (the WHO timing, checkpoint
+debouncing) is completely unchanged, only *when* it runs per NanoOWL
+result rather than per camera frame. The threading/queue mechanics were
+exercised with a stubbed-out fake predictor (confirming `predict()` is
+never called from more than one thread and that frames are dropped, not
+queued, under load), but actually running this against the real
+NanoOWL/TensorRT engine on a Jetson has not been done here. Treat it as
+unverified on real hardware until it's been run on-device — watch for
+anything CUDA/TensorRT related in `logs/argus.log` or a crash instead of a
+clean exit the first time you run it live, and revert to a synchronous
+`predictor.predict()` call in the capture loop if so.
+
+Separately, and with no such risk: the camera requests a fixed 640×480
+resolution and a 1-frame driver buffer (`CAP_PROP_BUFFERSIZE`), so
+`camera.read()` always returns the newest frame instead of one from a
+growing backlog, and every per-frame cost (color conversion, PIL
+conversion, NanoOWL preprocessing) scales with a sane frame size instead
+of whatever high-res default the camera driver picks. Startup failures are
+shown in a dialog and recorded in `logs/argus.log`; the sink test also
+always releases the camera, stops the NanoOWL worker thread, and closes
+its window on exit, even if NanoOWL raises mid-session.
 
 The on-screen HUD (`draw_checklist`, `result_screen`, detection boxes) now
 shares one brand palette (`PANEL_BG`/`MINT`/`CYAN`/`AMBER`/`CORAL`/... near
@@ -130,7 +151,10 @@ background-fixture gray) instead of eight unrelated debug colors.
 - `bubbles/camera.py` — threaded camera and landmark-based rubbing estimator
 - `nanoowl_monitor.py` — Real sink test: NanoOWL camera capture, drawing, and
   the WHO-guided workflow's `main()` entry point (needs the NanoOWL/TensorRT
-  container to import or run)
+  container to import or run). `AsyncOwlPredictor` in this file runs
+  NanoOWL inference on its own worker thread so the capture loop and
+  display aren't blocked on TensorRT latency — see the live-camera section
+  above for the threading design and its unverified-on-hardware caveat.
 - `nanoowl_logic.py` — the sink test's geometry, timing, checklist, and
   automatic wet/rinse/dry/faucet-close detection logic, kept free of
   NanoOWL/camera dependencies so it can be unit tested anywhere. Also owns

@@ -1,5 +1,7 @@
 import cv2
+import queue
 import sys
+import threading
 import time
 import numpy as np
 import PIL.Image
@@ -595,6 +597,100 @@ def open_camera():
     return camera
 
 
+# =========================================================
+# ASYNC NANOOWL INFERENCE
+# =========================================================
+# Room hand test already runs MediaPipe on its own thread
+# (bubbles/camera.py's AsyncHandVision) so a slow inference cycle can't
+# stall the camera window. The real sink test used to call
+# predictor.predict() directly in the capture loop instead, so its frame
+# rate tracked TensorRT inference latency exactly - see the README history
+# for why that was left alone rather than guessed at: NanoOWL's
+# CUDA/TensorRT context must only ever be touched from the thread that
+# created it, and getting that wrong is a crash, not just a slowdown.
+#
+# AsyncOwlPredictor applies the same pattern Room mode already uses,
+# safely, because it keeps that rule explicit: exactly one worker thread
+# is ever created, and it is the only thread that ever calls predict() -
+# the capture loop only calls submit()/latest(). Frames are dropped, not
+# queued (maxsize=1, get_nowait+put_nowait), so a slow inference cycle
+# skips stale frames instead of building a backlog.
+#
+# This has only been verified by reading the code and by the fact that
+# nanoowl_logic.py's decision-logic tests are untouched (nothing about the
+# WHO-timing math changed, only when it runs) - actually exercising this
+# against the NanoOWL/TensorRT engine on a Jetson has not been done here,
+# since neither is available in this environment. Treat it as unverified
+# on real hardware until it's been run on-device.
+class OwlResult:
+    """One completed NanoOWL prediction, paired with the exact frame and
+    capture timestamp it was computed from - so motion/geometry code
+    downstream always compares matching data instead of whatever the
+    latest live camera frame happens to be by the time the result lands."""
+
+    __slots__ = ("output", "frame", "timestamp")
+
+    def __init__(self, output, frame, timestamp):
+        self.output = output
+        self.frame = frame
+        self.timestamp = timestamp
+
+
+class AsyncOwlPredictor:
+    """Runs TreePredictor.predict() on a single dedicated worker thread
+    instead of the main capture loop, so a slow TensorRT cycle no longer
+    blocks camera reads or the display window."""
+
+    def __init__(self, predictor, tree, threshold, clip_encodings, owl_encodings):
+        self.predictor = predictor
+        self.tree = tree
+        self.threshold = threshold
+        self.clip_encodings = clip_encodings
+        self.owl_encodings = owl_encodings
+        self.jobs = queue.Queue(maxsize=1)
+        self.lock = threading.Lock()
+        self.result = None
+        self.sequence = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, frame, timestamp):
+        try:
+            self.jobs.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.jobs.put_nowait((frame, timestamp))
+        except queue.Full:
+            pass
+
+    def latest(self):
+        with self.lock:
+            return self.sequence, self.result
+
+    def _run(self):
+        while self.running:
+            try:
+                frame, timestamp = self.jobs.get(timeout=.2)
+            except queue.Empty:
+                continue
+            output = self.predictor.predict(
+                cv2_to_pil(frame),
+                tree=self.tree,
+                threshold=self.threshold,
+                clip_text_encodings=self.clip_encodings,
+                owl_text_encodings=self.owl_encodings,
+            )
+            with self.lock:
+                self.result = OwlResult(output, frame, timestamp)
+                self.sequence += 1
+
+    def close(self):
+        self.running = False
+        self.thread.join(timeout=2)
+
+
 def main():
 
     # =========================================================
@@ -634,14 +730,24 @@ def main():
         raise SystemExit
 
     # =========================================================
+    # NANOOWL WORKER
+    # =========================================================
+    # Inference now runs on its own thread (see AsyncOwlPredictor above) so
+    # a slow TensorRT cycle no longer blocks camera reads or cv2.imshow -
+    # only the boxes/checklist lag a frame or two behind, the same
+    # tradeoff Room hand test already makes for MediaPipe.
+
+    owl = AsyncOwlPredictor(
+        predictor, tree, DETECTION_THRESHOLD, clip_encodings, owl_encodings
+    )
+
+    # =========================================================
     # MAIN VARIABLES
     # =========================================================
 
     monitor = reset_monitor()
 
     previous_gray = None
-
-    last_frame_time = time.monotonic()
 
     # Set the moment camera.read() first starts failing in a row; cleared
     # the moment it succeeds again. Drives the reconnect-and-retry below
@@ -652,6 +758,41 @@ def main():
     # so the thresholds in config.json can be tuned against what the camera
     # is actually seeing, instead of guessed blind. Nothing here is saved.
     calibration = False
+
+    # Sequence number of the last AsyncOwlPredictor result actually acted
+    # on, and the timestamp (of the frame that produced it) evidence was
+    # last integrated up to - both drive delta_time below so WHO timing is
+    # measured against real elapsed time between processed frames, not
+    # against however often the display loop happens to run.
+    processed_sequence = -1
+    last_processed_time = None
+
+    # Detection/geometry state from the most recently processed NanoOWL
+    # result, kept across iterations so the overlay and checklist can keep
+    # drawing the latest known result on every displayed frame even when a
+    # new result hasn't arrived yet.
+    left_hand = right_hand = left_forearm = right_forearm = None
+    soap_detection = water_detection = towel_detection = faucet_detection = None
+    activity_roi = None
+    changed_ratio = 0.0
+    contact_detected = False
+    valid_rubbing = False
+    towel_faucet_contact = False
+
+    def clear_detection_state():
+        nonlocal left_hand, right_hand, left_forearm, right_forearm
+        nonlocal soap_detection, water_detection, towel_detection, faucet_detection
+        nonlocal activity_roi, changed_ratio, contact_detected, valid_rubbing
+        nonlocal towel_faucet_contact, processed_sequence, last_processed_time
+        left_hand = right_hand = left_forearm = right_forearm = None
+        soap_detection = water_detection = towel_detection = faucet_detection = None
+        activity_roi = None
+        changed_ratio = 0.0
+        contact_detected = False
+        valid_rubbing = False
+        towel_faucet_contact = False
+        processed_sequence = -1
+        last_processed_time = None
 
     # =========================================================
     # MAIN LOOP
@@ -687,150 +828,547 @@ def main():
             # =====================================================
             # TIME
             # =====================================================
+            # `now` is this displayed frame's live timestamp - used for
+            # everything that must stay responsive every frame regardless
+            # of inference cadence (submitting work, manual key fallbacks,
+            # the result-display timeout, the on-screen elapsed readouts).
 
-            current_time = time.monotonic()
-
-            delta_time = min(current_time - last_frame_time, 0.5)
-
-            last_frame_time = current_time
-
-            # =====================================================
-            # GRAYSCALE FOR MOTION
-            # =====================================================
-
-            current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            now = time.monotonic()
 
             # =====================================================
-            # NANOOWL PREDICTION
+            # SUBMIT FRAME / COLLECT LATEST NANOOWL RESULT
             # =====================================================
+            # Never blocks: submit() replaces any not-yet-processed job,
+            # and latest() just reads whatever AsyncOwlPredictor's worker
+            # thread has finished so far.
 
-            output = predictor.predict(
-                cv2_to_pil(frame),
-                tree=tree,
-                threshold=(DETECTION_THRESHOLD),
-                clip_text_encodings=(clip_encodings),
-                owl_text_encodings=(owl_encodings),
-            )
+            owl.submit(frame, now)
+            new_sequence, result = owl.latest()
 
-            # =====================================================
-            # COLLECT DETECTIONS
-            # =====================================================
+            if result is not None and new_sequence != processed_sequence:
 
-            hands = []
+                processed_sequence = new_sequence
 
-            forearms = []
+                # This result's own timestamp (from when its frame was
+                # submitted) drives delta_time, so WHO timing reflects real
+                # elapsed time between processed frames - not the display
+                # loop's rate, which can now run faster than inference.
+                delta_time = (
+                    0.0
+                    if last_processed_time is None
+                    else min(result.timestamp - last_processed_time, 0.5)
+                )
+                last_processed_time = result.timestamp
+                current_time = result.timestamp
 
-            soap_detections = []
+                # =================================================
+                # GRAYSCALE FOR MOTION
+                # =================================================
+                # Computed from the exact frame NanoOWL just processed, so
+                # it lines up with this result's boxes - not necessarily
+                # the newest live camera frame.
 
-            water_detections = []
+                current_gray = cv2.cvtColor(result.frame, cv2.COLOR_BGR2GRAY)
 
-            towel_detections = []
+                # =================================================
+                # COLLECT DETECTIONS
+                # =================================================
 
-            faucet_detections = []
+                hands = []
 
-            for detection in output.detections:
+                forearms = []
 
-                if detection.parent_id != 0:
-                    continue
+                soap_detections = []
 
-                box = tuple(float(value) for value in detection.box)
+                water_detections = []
 
-                if box[2] <= box[0] or box[3] <= box[1]:
-                    continue
+                towel_detections = []
 
-                label = detection_name(detection, tree)
+                faucet_detections = []
 
-                if len(detection.scores) > 0:
+                for detection in result.output.detections:
 
-                    score = float(detection.scores[-1])
+                    if detection.parent_id != 0:
+                        continue
 
-                else:
+                    box = tuple(float(value) for value in detection.box)
 
-                    score = 0.0
+                    if box[2] <= box[0] or box[3] <= box[1]:
+                        continue
 
-                item = {"box": box, "label": label, "score": score}
+                    label = detection_name(detection, tree)
 
-                label_lower = label.lower()
+                    if len(detection.scores) > 0:
 
-                # -------------------------------------------------
+                        score = float(detection.scores[-1])
+
+                    else:
+
+                        score = 0.0
+
+                    item = {"box": box, "label": label, "score": score}
+
+                    label_lower = label.lower()
+
+                    # -----------------------------------------------
+                    # SOAP / FOAM
+                    # -----------------------------------------------
+
+                    if "soap" in label_lower or "foam" in label_lower:
+
+                        soap_detections.append(item)
+
+                    # -----------------------------------------------
+                    # RUNNING WATER
+                    # -----------------------------------------------
+
+                    elif "water" in label_lower:
+
+                        water_detections.append(item)
+
+                    # -----------------------------------------------
+                    # TOWEL
+                    # -----------------------------------------------
+
+                    elif "towel" in label_lower:
+
+                        towel_detections.append(item)
+
+                    # -----------------------------------------------
+                    # FAUCET
+                    # -----------------------------------------------
+
+                    elif "faucet" in label_lower:
+
+                        faucet_detections.append(item)
+
+                    # -----------------------------------------------
+                    # FOREARMS
+                    # -----------------------------------------------
+
+                    elif "forearm" in label_lower:
+
+                        forearms.append(item)
+
+                    # -----------------------------------------------
+                    # HANDS
+                    # -----------------------------------------------
+
+                    elif "hand" in label_lower:
+
+                        hands.append(item)
+
+                # =================================================
+                # SELECT HANDS / FOREARMS
+                # =================================================
+                # Selected before soap/water evidence below so those can be
+                # required to actually be near the hands/forearms in
+                # frame, not just present anywhere in the picture.
+
+                left_hand, right_hand = strongest_by_side(hands)
+
+                left_forearm, right_forearm = strongest_by_side(forearms)
+
+                selected_hands = [
+                    item for item in (left_hand, right_hand) if item is not None
+                ]
+
+                selected_forearms = [
+                    item for item in (left_forearm, right_forearm) if item is not None
+                ]
+
+                hand_boxes = [item["box"] for item in selected_hands]
+
+                forearm_boxes = [item["box"] for item in selected_forearms]
+
+                # Skipped (never required) when no hand/forearm box is
+                # visible at all this frame, so momentary occlusion of the
+                # hands can't itself break wet/rinse/soap detection.
+                active_boxes = hand_boxes + forearm_boxes
+
+                # =================================================
                 # SOAP / FOAM
-                # -------------------------------------------------
+                # =================================================
 
-                if "soap" in label_lower or "foam" in label_lower:
+                soap_detection = max(
+                    soap_detections, key=lambda item: item["score"], default=None
+                )
 
-                    soap_detections.append(item)
+                soap_evidence = (
+                    soap_detection is not None
+                    and soap_detection["score"] >= SOAP_EVIDENCE_THRESHOLD
+                    and monitor["armed"]
+                    and monitor["wet_confirmed"]
+                    and (
+                        not active_boxes
+                        or box_near_any(
+                            soap_detection["box"], active_boxes, HAND_PROXIMITY_PADDING
+                        )
+                    )
+                )
 
-                # -------------------------------------------------
-                # RUNNING WATER
-                # -------------------------------------------------
+                if advance_soap_evidence(monitor, soap_evidence, delta_time):
+                    print("Soap / foam observed near the hands.")
 
-                elif "water" in label_lower:
+                # =================================================
+                # WATER / TOWEL / FAUCET
+                # =================================================
+                # Raw per-result evidence for the automatic
+                # wet/rinse/dry/tap-off checkpoints. The actual
+                # confirmation timing/debounce lives in nanoowl_logic's
+                # advance_*_evidence functions, called after hand/forearm
+                # geometry and rubbing time are settled below.
 
-                    water_detections.append(item)
+                water_detection = max(
+                    water_detections, key=lambda item: item["score"], default=None
+                )
+                water_evidence = (
+                    water_detection is not None
+                    and water_detection["score"] >= WATER_EVIDENCE_THRESHOLD
+                    and monitor["armed"]
+                    and (
+                        not active_boxes
+                        or box_near_any(
+                            water_detection["box"], active_boxes, HAND_PROXIMITY_PADDING
+                        )
+                    )
+                )
 
-                # -------------------------------------------------
-                # TOWEL
-                # -------------------------------------------------
+                towel_detection = max(
+                    towel_detections, key=lambda item: item["score"], default=None
+                )
+                towel_evidence = (
+                    towel_detection is not None
+                    and towel_detection["score"] >= TOWEL_EVIDENCE_THRESHOLD
+                )
 
-                elif "towel" in label_lower:
+                faucet_detection = max(
+                    faucet_detections, key=lambda item: item["score"], default=None
+                )
 
-                    towel_detections.append(item)
+                towel_faucet_contact = (
+                    towel_evidence
+                    and faucet_detection is not None
+                    and boxes_connected(
+                        towel_detection["box"],
+                        faucet_detection["box"],
+                        TOWEL_FAUCET_PADDING,
+                    )
+                )
 
-                # -------------------------------------------------
-                # FAUCET
-                # -------------------------------------------------
+                # =================================================
+                # HAND GEOMETRY
+                # =================================================
 
-                elif "faucet" in label_lower:
+                two_hands_visible = len(hand_boxes) == 2
 
-                    faucet_detections.append(item)
+                hands_connected = two_hands_visible and boxes_connected(
+                    hand_boxes[0], hand_boxes[1], BOX_CONNECTION_PADDING
+                )
 
-                # -------------------------------------------------
-                # FOREARMS
-                # -------------------------------------------------
+                # =================================================
+                # FOREARM GEOMETRY
+                # =================================================
 
-                elif "forearm" in label_lower:
+                two_forearms_visible = len(forearm_boxes) == 2
 
-                    forearms.append(item)
+                forearms_close = two_forearms_visible and boxes_connected(
+                    forearm_boxes[0], forearm_boxes[1], MAX_FOREARM_GAP
+                )
 
-                # -------------------------------------------------
-                # HANDS
-                # -------------------------------------------------
+                # =================================================
+                # ARM SESSION
+                # =================================================
 
-                elif "hand" in label_lower:
+                if two_hands_visible and not monitor["armed"]:
 
-                    hands.append(item)
+                    monitor["armed"] = True
 
-            # =====================================================
-            # SELECT HANDS / FOREARMS
-            # =====================================================
-            # Selected before soap/water evidence below so those can be
-            # required to actually be near the hands/forearms in frame,
-            # not just present anywhere in the picture.
+                    # WHO's 40-60s window times the wash procedure itself,
+                    # starting at "wet hands" (step 1). Room mode has no
+                    # wet step and never claims WHO compliance, so its
+                    # practice timer starts as soon as hands are seen
+                    # instead.
+                    if ROOM_MODE:
+                        monitor["started_at"] = current_time
 
-            left_hand, right_hand = strongest_by_side(hands)
+                    monitor["state"] = "TWO_HANDS_READY"
 
-            left_forearm, right_forearm = strongest_by_side(forearms)
+                    print("Two hands detected. " "Session armed.")
 
-            selected_hands = [
-                item for item in (left_hand, right_hand) if item is not None
-            ]
+                # =================================================
+                # MOTION REGION
+                # =================================================
 
-            selected_forearms = [
-                item for item in (left_forearm, right_forearm) if item is not None
-            ]
+                visible_boxes = hand_boxes + forearm_boxes
 
-            hand_boxes = [item["box"] for item in selected_hands]
+                activity_roi = union_box(visible_boxes, result.frame.shape, ROI_PADDING)
 
-            forearm_boxes = [item["box"] for item in selected_forearms]
+                changed_ratio = motion_ratio(current_gray, previous_gray, activity_roi)
 
-            # Skipped (never required) when no hand/forearm box is visible
-            # at all this frame, so momentary occlusion of the hands can't
-            # itself break wet/rinse/soap detection.
-            active_boxes = hand_boxes + forearm_boxes
+                movement_detected = changed_ratio >= MINIMUM_MOTION_RATIO
+
+                # =================================================
+                # CONTACT DETECTION
+                # =================================================
+
+                # Case 1:
+                # Two hand boxes remain visible
+                # and connect.
+                #
+                # Case 2:
+                # Hands merge into one NanoOWL box
+                # but two close forearms remain visible.
+
+                merged_contact = (
+                    monitor["armed"] and len(hand_boxes) == 1 and forearms_close
+                )
+
+                contact_detected = monitor["armed"] and (
+                    hands_connected or merged_contact
+                )
+
+                # =================================================
+                # AUTOMATIC WET CONFIRMATION (WHO step 1)
+                # =================================================
+                # Must run before VALID RUBBING below, since rubbing
+                # validity depends on wet_confirmed in the real (non-room)
+                # sink test.
+
+                if advance_wet_evidence(monitor, water_evidence, delta_time):
+                    if not ROOM_MODE:
+                        monitor["started_at"] = current_time
+                    print("Auto-detected: hands wetted (water seen 3s).")
+
+                # =================================================
+                # VALID RUBBING
+                # =================================================
+
+                valid_rubbing = (
+                    contact_detected
+                    and movement_detected
+                    and (
+                        ROOM_MODE
+                        or (monitor["wet_confirmed"] and monitor["soap_seen"])
+                    )
+                )
+
+                # =================================================
+                # INITIAL 5 SECOND CONFIRMATION
+                # =================================================
+
+                if monitor["result"] is None and not monitor["rubbing_confirmed"]:
+
+                    if valid_rubbing:
+
+                        monitor["confirmation_time"] += delta_time
+
+                        monitor["state"] = "CONFIRMING_RUBBING"
+
+                        # ---------------------------------------------
+                        # FIVE CONTINUOUS SECONDS REACHED
+                        # ---------------------------------------------
+
+                        if monitor["confirmation_time"] >= INITIAL_CONFIRMATION_TIME:
+
+                            monitor["confirmation_time"] = INITIAL_CONFIRMATION_TIME
+
+                            monitor["rubbing_confirmed"] = True
+
+                            # Initial five seconds
+                            # count toward total.
+                            monitor["rubbing_time"] = INITIAL_CONFIRMATION_TIME
+
+                            monitor["state"] = "CONFIRMED_RUBBING"
+
+                            print("Rubbing confirmed " "after 5 continuous seconds.")
+
+                    else:
+
+                        # Initial five seconds
+                        # must be continuous.
+                        monitor["confirmation_time"] = 0.0
+
+                        if monitor["armed"]:
+
+                            monitor["state"] = "TWO_HANDS_READY"
+
+                        else:
+
+                            monitor["state"] = "WAITING"
+
+                # =================================================
+                # AFTER INITIAL 5 SECOND CONFIRMATION
+                # =================================================
+
+                elif (
+                    monitor["result"] is None
+                    and monitor["rubbing_confirmed"]
+                    and monitor["rubbing_time"] < REQUIRED_RUB_TIME
+                ):
+
+                    # =============================================
+                    # HANDS TOGETHER
+                    # =============================================
+
+                    if contact_detected:
+
+                        # Hands returned before
+                        # separation reached 5 seconds.
+                        monitor["separated_since"] = None
+
+                        if valid_rubbing:
+
+                            monitor["rubbing_time"] += delta_time
+
+                            monitor["state"] = "CONFIRMED_RUBBING"
+
+                        else:
+
+                            # Still touching,
+                            # but not enough motion.
+                            monitor["state"] = "CONTACT_NO_MOTION"
+
+                    # =============================================
+                    # HANDS SEPARATED
+                    # =============================================
+
+                    else:
+
+                        if monitor["separated_since"] is None:
+
+                            monitor["separated_since"] = current_time
+
+                            print("Hands separated. " "Starting separation timer.")
+
+                        separation_time = current_time - monitor["separated_since"]
+
+                        monitor["state"] = "HANDS_SEPARATED"
+
+                        # ---------------------------------------------
+                        # PROLONGED SEPARATION -> INCOMPLETE
+                        # ---------------------------------------------
+
+                        if separation_time >= MAX_SEPARATION_TIME:
+
+                            monitor["result"] = "INCORRECT"
+
+                            monitor["result_reason"] = (
+                                "Hands separated "
+                                f"for more than {MAX_SEPARATION_TIME:.0f} seconds"
+                            )
+
+                            monitor["result_started"] = current_time
+
+                            monitor["state"] = "INCOMPLETE"
+
+                            print(
+                                "INCORRECT: "
+                                "hands remained separated "
+                                f"for {MAX_SEPARATION_TIME:.0f} seconds."
+                            )
+
+                # =================================================
+                # AUTOMATIC RINSE / DRY / FAUCET CONFIRMATION
+                # (WHO steps 9-11) - runs now that rubbing_time is settled
+                # for this result.
+                # =================================================
+
+                rub_target_reached = monitor["rubbing_time"] >= REQUIRED_RUB_TIME
+
+                if advance_rinse_evidence(
+                    monitor, water_evidence, rub_target_reached, delta_time
+                ):
+                    print("Auto-detected: rinse complete (water stopped).")
+
+                if advance_dry_evidence(monitor, towel_evidence, delta_time):
+                    print("Auto-detected: towel in use - hands dried.")
+
+                if advance_faucet_evidence(monitor, towel_faucet_contact):
+                    print("Auto-detected: towel touched faucet - tap closed with towel.")
+
+                # =================================================
+                # 40-60 SECOND PROCEDURE WINDOW
+                # =================================================
+
+                if (
+                    monitor["result"] is None
+                    and monitor["started_at"] is not None
+                    and procedure_elapsed(monitor, current_time) > MAXIMUM_WASH_TIME
+                ):
+                    monitor["state"] = "INCOMPLETE"
+                    monitor["result"] = "INCORRECT"
+                    missing = missing_checkpoints(monitor, ROOM_MODE)
+                    monitor["result_reason"] = (
+                        "60s elapsed; missing: " + ", ".join(missing[:2])
+                        if missing
+                        else "Procedure exceeded the 40-60s window"
+                    )
+                    monitor["result_started"] = current_time
+                    print("INCOMPLETE:", monitor["result_reason"])
+
+                # =================================================
+                # WHO-GUIDED FINAL VALIDATION
+                # =================================================
+
+                if (
+                    monitor["result"] is None
+                    and monitor["rubbing_confirmed"]
+                    and monitor["rubbing_time"] >= REQUIRED_RUB_TIME
+                ):
+
+                    # Stop the active-rubbing timer at the coached
+                    # sequence duration.
+                    monitor["rubbing_time"] = REQUIRED_RUB_TIME
+
+                    elapsed = procedure_elapsed(monitor, current_time)
+                    ready = (
+                        not missing_checkpoints(monitor, ROOM_MODE)
+                        and elapsed >= MINIMUM_WASH_TIME
+                    )
+
+                    if ROOM_MODE and elapsed >= MINIMUM_WASH_TIME:
+                        monitor["state"] = "PRACTICE_COMPLETE"
+                        monitor["result"] = "PRACTICE"
+                        monitor["result_started"] = current_time
+                        print("PRACTICE COMPLETE: not recorded as WHO-verified hygiene.")
+                    elif ready:
+                        monitor["state"] = "COMPLETE"
+                        monitor["result"] = "CORRECT"
+                        monitor["result_started"] = current_time
+                        print("OBSERVED STEPS COMPLETE: WHO-guided 40-60 second workflow.")
+                    else:
+                        monitor["state"] = "AWAITING_CHECKPOINTS"
+
+                # =================================================
+                # TECHNIQUE-VARIATION COACHING (non-blocking nudge)
+                # =================================================
+
+                if (
+                    monitor["rubbing_confirmed"]
+                    and monitor["rubbing_time"] < REQUIRED_RUB_TIME
+                ):
+                    advance_technique_variation(
+                        monitor, monitor["rubbing_time"], hand_boxes
+                    )
+
+                # =================================================
+                # STALL TRACKING (nudge toward the W/N/D/F fallback)
+                # =================================================
+
+                advance_stall_tracking(monitor, current_time)
+
+                previous_gray = current_gray
 
             # =====================================================
             # DRAW DETECTIONS
             # =====================================================
+            # Runs every displayed frame, on the freshest live camera
+            # frame, using whatever result is latest known - so the video
+            # stays smooth even on frames where NanoOWL hasn't finished a
+            # new one yet. This mirrors bubbles/camera.py's
+            # draw_landmarks(frame, result, cv2), which does the same
+            # thing for Room hand test's async MediaPipe result.
 
             if left_hand:
 
@@ -848,30 +1386,6 @@ def main():
 
                 draw_box(frame, right_forearm["box"], "RIGHT FOREARM", CYAN)
 
-            # =====================================================
-            # SOAP / FOAM
-            # =====================================================
-
-            soap_detection = max(
-                soap_detections, key=lambda item: item["score"], default=None
-            )
-
-            soap_evidence = (
-                soap_detection is not None
-                and soap_detection["score"] >= SOAP_EVIDENCE_THRESHOLD
-                and monitor["armed"]
-                and monitor["wet_confirmed"]
-                and (
-                    not active_boxes
-                    or box_near_any(
-                        soap_detection["box"], active_boxes, HAND_PROXIMITY_PADDING
-                    )
-                )
-            )
-
-            if advance_soap_evidence(monitor, soap_evidence, delta_time):
-                print("Soap / foam observed near the hands.")
-
             if soap_detection is not None:
 
                 draw_box(
@@ -885,107 +1399,14 @@ def main():
                     AMBER,
                 )
 
-            # =====================================================
-            # WATER / TOWEL / FAUCET
-            # =====================================================
-            # Raw per-frame evidence for the automatic wet/rinse/dry/tap-off
-            # checkpoints. The actual confirmation timing/debounce lives in
-            # nanoowl_logic's advance_*_evidence functions, called after
-            # hand/forearm geometry and rubbing time are settled below.
-
-            water_detection = max(
-                water_detections, key=lambda item: item["score"], default=None
-            )
-            water_evidence = (
-                water_detection is not None
-                and water_detection["score"] >= WATER_EVIDENCE_THRESHOLD
-                and monitor["armed"]
-                and (
-                    not active_boxes
-                    or box_near_any(
-                        water_detection["box"], active_boxes, HAND_PROXIMITY_PADDING
-                    )
-                )
-            )
             if water_detection is not None:
                 draw_box(frame, water_detection["box"], "WATER", AMBER)
 
-            towel_detection = max(
-                towel_detections, key=lambda item: item["score"], default=None
-            )
-            towel_evidence = (
-                towel_detection is not None
-                and towel_detection["score"] >= TOWEL_EVIDENCE_THRESHOLD
-            )
             if towel_detection is not None:
                 draw_box(frame, towel_detection["box"], "TOWEL", AMBER)
 
-            faucet_detection = max(
-                faucet_detections, key=lambda item: item["score"], default=None
-            )
             if faucet_detection is not None:
                 draw_box(frame, faucet_detection["box"], "FAUCET", FIXTURE)
-
-            towel_faucet_contact = (
-                towel_evidence
-                and faucet_detection is not None
-                and boxes_connected(
-                    towel_detection["box"],
-                    faucet_detection["box"],
-                    TOWEL_FAUCET_PADDING,
-                )
-            )
-
-            # =====================================================
-            # HAND GEOMETRY
-            # =====================================================
-
-            two_hands_visible = len(hand_boxes) == 2
-
-            hands_connected = two_hands_visible and boxes_connected(
-                hand_boxes[0], hand_boxes[1], BOX_CONNECTION_PADDING
-            )
-
-            # =====================================================
-            # FOREARM GEOMETRY
-            # =====================================================
-
-            two_forearms_visible = len(forearm_boxes) == 2
-
-            forearms_close = two_forearms_visible and boxes_connected(
-                forearm_boxes[0], forearm_boxes[1], MAX_FOREARM_GAP
-            )
-
-            # =====================================================
-            # ARM SESSION
-            # =====================================================
-
-            if two_hands_visible and not monitor["armed"]:
-
-                monitor["armed"] = True
-
-                # WHO's 40-60s window times the wash procedure itself,
-                # starting at "wet hands" (step 1). Room mode has no wet
-                # step and never claims WHO compliance, so its practice
-                # timer starts as soon as hands are seen instead.
-                if ROOM_MODE:
-                    monitor["started_at"] = current_time
-
-                monitor["state"] = "TWO_HANDS_READY"
-
-                print("Two hands detected. " "Session armed.")
-
-            # =====================================================
-            # MOTION REGION
-            # =====================================================
-
-            visible_boxes = hand_boxes + forearm_boxes
-
-            activity_roi = union_box(visible_boxes, frame.shape, ROI_PADDING)
-
-            changed_ratio = motion_ratio(current_gray, previous_gray, activity_roi)
-
-            movement_detected = changed_ratio >= MINIMUM_MOTION_RATIO
 
             # Small subtle motion ROI.
             if activity_roi is not None:
@@ -995,260 +1416,25 @@ def main():
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (160, 160, 160), 1)
 
             # =====================================================
-            # CONTACT DETECTION
-            # =====================================================
-
-            # Case 1:
-            # Two hand boxes remain visible
-            # and connect.
-            #
-            # Case 2:
-            # Hands merge into one NanoOWL box
-            # but two close forearms remain visible.
-
-            merged_contact = (
-                monitor["armed"] and len(hand_boxes) == 1 and forearms_close
-            )
-
-            contact_detected = monitor["armed"] and (hands_connected or merged_contact)
-
-            # =====================================================
-            # AUTOMATIC WET CONFIRMATION (WHO step 1)
-            # =====================================================
-            # Must run before VALID RUBBING below, since rubbing validity
-            # depends on wet_confirmed in the real (non-room) sink test.
-
-            if advance_wet_evidence(monitor, water_evidence, delta_time):
-                if not ROOM_MODE:
-                    monitor["started_at"] = current_time
-                print("Auto-detected: hands wetted (water seen 3s).")
-
-            # =====================================================
-            # VALID RUBBING
-            # =====================================================
-
-            valid_rubbing = (
-                contact_detected
-                and movement_detected
-                and (ROOM_MODE or (monitor["wet_confirmed"] and monitor["soap_seen"]))
-            )
-
-            # =====================================================
-            # INITIAL 5 SECOND CONFIRMATION
-            # =====================================================
-
-            if monitor["result"] is None and not monitor["rubbing_confirmed"]:
-
-                if valid_rubbing:
-
-                    monitor["confirmation_time"] += delta_time
-
-                    monitor["state"] = "CONFIRMING_RUBBING"
-
-                    # ---------------------------------------------
-                    # FIVE CONTINUOUS SECONDS REACHED
-                    # ---------------------------------------------
-
-                    if monitor["confirmation_time"] >= INITIAL_CONFIRMATION_TIME:
-
-                        monitor["confirmation_time"] = INITIAL_CONFIRMATION_TIME
-
-                        monitor["rubbing_confirmed"] = True
-
-                        # Initial five seconds
-                        # count toward total.
-                        monitor["rubbing_time"] = INITIAL_CONFIRMATION_TIME
-
-                        monitor["state"] = "CONFIRMED_RUBBING"
-
-                        print("Rubbing confirmed " "after 5 continuous seconds.")
-
-                else:
-
-                    # Initial five seconds
-                    # must be continuous.
-                    monitor["confirmation_time"] = 0.0
-
-                    if monitor["armed"]:
-
-                        monitor["state"] = "TWO_HANDS_READY"
-
-                    else:
-
-                        monitor["state"] = "WAITING"
-
-            # =====================================================
-            # AFTER INITIAL 5 SECOND CONFIRMATION
-            # =====================================================
-
-            elif (
-                monitor["result"] is None
-                and monitor["rubbing_confirmed"]
-                and monitor["rubbing_time"] < REQUIRED_RUB_TIME
-            ):
-
-                # =================================================
-                # HANDS TOGETHER
-                # =================================================
-
-                if contact_detected:
-
-                    # Hands returned before
-                    # separation reached 5 seconds.
-                    monitor["separated_since"] = None
-
-                    if valid_rubbing:
-
-                        monitor["rubbing_time"] += delta_time
-
-                        monitor["state"] = "CONFIRMED_RUBBING"
-
-                    else:
-
-                        # Still touching,
-                        # but not enough motion.
-                        monitor["state"] = "CONTACT_NO_MOTION"
-
-                # =================================================
-                # HANDS SEPARATED
-                # =================================================
-
-                else:
-
-                    if monitor["separated_since"] is None:
-
-                        monitor["separated_since"] = current_time
-
-                        print("Hands separated. " "Starting separation timer.")
-
-                    separation_time = current_time - monitor["separated_since"]
-
-                    monitor["state"] = "HANDS_SEPARATED"
-
-                    # ---------------------------------------------
-                    # PROLONGED SEPARATION -> INCOMPLETE
-                    # ---------------------------------------------
-
-                    if separation_time >= MAX_SEPARATION_TIME:
-
-                        monitor["result"] = "INCORRECT"
-
-                        monitor["result_reason"] = (
-                            "Hands separated "
-                            f"for more than {MAX_SEPARATION_TIME:.0f} seconds"
-                        )
-
-                        monitor["result_started"] = current_time
-
-                        monitor["state"] = "INCOMPLETE"
-
-                        print(
-                            "INCORRECT: "
-                            "hands remained separated "
-                            f"for {MAX_SEPARATION_TIME:.0f} seconds."
-                        )
-
-            # =====================================================
-            # AUTOMATIC RINSE / DRY / FAUCET CONFIRMATION
-            # (WHO steps 9-11) - runs now that rubbing_time is settled
-            # for this frame.
-            # =====================================================
-
-            rub_target_reached = monitor["rubbing_time"] >= REQUIRED_RUB_TIME
-
-            if advance_rinse_evidence(
-                monitor, water_evidence, rub_target_reached, delta_time
-            ):
-                print("Auto-detected: rinse complete (water stopped).")
-
-            if advance_dry_evidence(monitor, towel_evidence, delta_time):
-                print("Auto-detected: towel in use - hands dried.")
-
-            if advance_faucet_evidence(monitor, towel_faucet_contact):
-                print("Auto-detected: towel touched faucet - tap closed with towel.")
-
-            # =====================================================
-            # 40-60 SECOND PROCEDURE WINDOW
-            # =====================================================
-
-            if (
-                monitor["result"] is None
-                and monitor["started_at"] is not None
-                and procedure_elapsed(monitor, current_time) > MAXIMUM_WASH_TIME
-            ):
-                monitor["state"] = "INCOMPLETE"
-                monitor["result"] = "INCORRECT"
-                missing = missing_checkpoints(monitor, ROOM_MODE)
-                monitor["result_reason"] = (
-                    "60s elapsed; missing: " + ", ".join(missing[:2])
-                    if missing
-                    else "Procedure exceeded the 40-60s window"
-                )
-                monitor["result_started"] = current_time
-                print("INCOMPLETE:", monitor["result_reason"])
-
-            # =====================================================
-            # WHO-GUIDED FINAL VALIDATION
-            # =====================================================
-
-            if (
-                monitor["result"] is None
-                and monitor["rubbing_confirmed"]
-                and monitor["rubbing_time"] >= REQUIRED_RUB_TIME
-            ):
-
-                # Stop the active-rubbing timer at the coached sequence duration.
-                monitor["rubbing_time"] = REQUIRED_RUB_TIME
-
-                elapsed = procedure_elapsed(monitor, current_time)
-                ready = (
-                    not missing_checkpoints(monitor, ROOM_MODE)
-                    and elapsed >= MINIMUM_WASH_TIME
-                )
-
-                if ROOM_MODE and elapsed >= MINIMUM_WASH_TIME:
-                    monitor["state"] = "PRACTICE_COMPLETE"
-                    monitor["result"] = "PRACTICE"
-                    monitor["result_started"] = current_time
-                    print("PRACTICE COMPLETE: not recorded as WHO-verified hygiene.")
-                elif ready:
-                    monitor["state"] = "COMPLETE"
-                    monitor["result"] = "CORRECT"
-                    monitor["result_started"] = current_time
-                    print("OBSERVED STEPS COMPLETE: WHO-guided 40-60 second workflow.")
-                else:
-                    monitor["state"] = "AWAITING_CHECKPOINTS"
-
-            # =====================================================
             # SEPARATION TIMER
             # =====================================================
+            # Live wall-clock readout - uses `now`, not the (possibly
+            # slightly older) last-processed-result timestamp, so the
+            # on-screen counter doesn't stall between inference results.
 
             if monitor["separated_since"] is not None:
 
-                separation_elapsed = current_time - monitor["separated_since"]
+                separation_elapsed = now - monitor["separated_since"]
 
             else:
 
                 separation_elapsed = 0.0
 
             # =====================================================
-            # TECHNIQUE-VARIATION COACHING (non-blocking nudge)
-            # =====================================================
-
-            if monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
-                advance_technique_variation(monitor, monitor["rubbing_time"], hand_boxes)
-
-            # =====================================================
-            # STALL TRACKING (nudge toward the W/N/D/F fallback)
-            # =====================================================
-
-            advance_stall_tracking(monitor, current_time)
-
-            # =====================================================
             # COMPACT CHECKLIST
             # =====================================================
 
-            draw_checklist(frame, monitor, separation_elapsed, current_time)
+            draw_checklist(frame, monitor, separation_elapsed, now)
 
             if calibration:
 
@@ -1314,6 +1500,8 @@ def main():
 
                 previous_gray = None
 
+                clear_detection_state()
+
             # =====================================================
             # CALIBRATION TOGGLE
             # =====================================================
@@ -1339,7 +1527,7 @@ def main():
                 if not ROOM_MODE:
                     # WHO step 1: this is when the timed 40-60s procedure
                     # actually begins, not whenever hands first appeared.
-                    monitor["started_at"] = current_time
+                    monitor["started_at"] = now
                 print("Manual fallback: hands wetted.")
 
             if (
@@ -1376,7 +1564,7 @@ def main():
 
             if (
                 monitor["result"] is not None
-                and (current_time - monitor["result_started"]) >= RESULT_DISPLAY_TIME
+                and (now - monitor["result_started"]) >= RESULT_DISPLAY_TIME
             ):
 
                 print("Result displayed for " "5 seconds.")
@@ -1387,11 +1575,14 @@ def main():
 
                 previous_gray = None
 
-            previous_gray = current_gray
+                clear_detection_state()
 
     finally:
+        owl.close()
         camera.release()
         cv2.destroyAllWindows()
+
+
 
 
 if __name__ == "__main__":
