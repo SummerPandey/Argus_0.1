@@ -53,6 +53,7 @@ class _FakeCapture:
 class _FakeCv2:
     CAP_PROP_FRAME_WIDTH = 3
     CAP_PROP_FRAME_HEIGHT = 4
+    CAP_PROP_FOURCC = 6
     CAP_PROP_BUFFERSIZE = 38
 
     def __init__(self, capture):
@@ -60,6 +61,10 @@ class _FakeCv2:
 
     def VideoCapture(self, candidate):
         return self._capture
+
+    @staticmethod
+    def VideoWriter_fourcc(*characters):
+        return 0
 
 
 class LatestFrameCameraFailureTests(unittest.TestCase):

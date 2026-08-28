@@ -25,6 +25,11 @@ class LatestFrameCamera:
                 "No camera could be opened. Reconnect the USB camera and close "
                 "other apps using it, then launch Argus again."
             )
+        # MJPG first: many USB cameras cap at 30 FPS in their uncompressed
+        # default format but reach 60 in MJPG; ignored harmlessly when
+        # unsupported. Then resolution and a 1-frame buffer so latest()
+        # really is the newest frame.
+        self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)

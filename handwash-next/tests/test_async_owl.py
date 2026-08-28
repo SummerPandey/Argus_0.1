@@ -70,13 +70,18 @@ class FakePredictor:
         return types.SimpleNamespace(detections=[])
 
 
-def _make_owl(predictor, loader_threads=None):
+def _make_owl(predictor, loader_threads=None, max_inference_fps=10_000):
     def loader():
         if loader_threads is not None:
             loader_threads.add(threading.get_ident())
         return predictor, "clip-encodings", "owl-encodings"
 
-    return nanoowl_monitor.AsyncOwlPredictor(loader, tree=object(), threshold=0.1)
+    # A very high default fps cap keeps these mechanics tests about the
+    # queue/thread behavior; the cap itself has its own dedicated test.
+    return nanoowl_monitor.AsyncOwlPredictor(
+        loader, tree=object(), threshold=0.1,
+        max_inference_fps=max_inference_fps,
+    )
 
 
 class AsyncOwlPredictorTests(unittest.TestCase):
@@ -155,6 +160,26 @@ class AsyncOwlPredictorTests(unittest.TestCase):
         finally:
             owl.close()
         self.assertFalse(owl.thread.is_alive())
+
+    def test_inference_cadence_cap_skips_too_soon_submissions(self):
+        # Deterministic: the cap compares the caller-supplied timestamps,
+        # so fake ones drive it exactly. At 5 FPS the minimum interval is
+        # 0.2 "seconds"; a submission 0.05 after the first must be
+        # skipped, one 0.3 after must go through.
+        predictor = FakePredictor()
+        owl = _make_owl(predictor, max_inference_fps=5)
+        try:
+            self.assertTrue(owl.wait_ready(timeout=3))
+            owl.submit(_frame(), 10.0)
+            self.assertTrue(_wait_for(lambda: predictor.calls == 1))
+            owl.submit(_frame(), 10.05)  # inside the interval: skipped
+            time.sleep(0.05)
+            self.assertEqual(predictor.calls, 1)
+            self.assertTrue(owl.jobs.empty())
+            owl.submit(_frame(), 10.3)  # past the interval: accepted
+            self.assertTrue(_wait_for(lambda: predictor.calls == 2))
+        finally:
+            owl.close()
 
     def test_close_returns_promptly_when_idle(self):
         owl = _make_owl(FakePredictor())

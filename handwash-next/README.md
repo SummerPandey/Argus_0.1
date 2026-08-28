@@ -140,12 +140,22 @@ for anything CUDA/TensorRT related in `logs/argus.log` the first time you
 run it live, and revert to a synchronous `predictor.predict()` call in
 the capture loop if so.
 
-Separately, and with no such risk: the camera requests a fixed 640×480
-resolution and a 1-frame driver buffer (`CAP_PROP_BUFFERSIZE`), so
-`camera.read()` always returns the newest frame instead of one from a
-growing backlog, and every per-frame cost (color conversion, PIL
-conversion, NanoOWL preprocessing) scales with a sane frame size instead
-of whatever high-res default the camera driver picks. Startup failures are
+Separately, and with no such risk: both camera paths request MJPG
+(`CAP_PROP_FOURCC`) before negotiating resolution, since many USB cameras
+cap at 30 FPS in their uncompressed default format but reach 60 in MJPG —
+raising the ceiling the now-decoupled display loop can actually hit, and
+harmlessly ignored by cameras that don't support it. The camera also
+requests a fixed 640×480 resolution and a 1-frame driver buffer
+(`CAP_PROP_BUFFERSIZE`), so `camera.read()` always returns the newest
+frame instead of one from a growing backlog, and every per-frame cost
+(color conversion, PIL conversion, NanoOWL preprocessing) scales with a
+sane frame size instead of whatever high-res default the camera driver
+picks. On the inference side, frames are handed to NanoOWL at most
+`MAX_INFERENCE_FPS` times per second (default 15, tunable in
+`config.json`) and not at all while a result screen is up — the checklist
+logic accumulates wall-clock time, so checking faster buys no
+responsiveness and only heats the Jetson toward thermal throttling, which
+is what actually lowers the sustained rate. Startup failures are
 shown in a dialog and recorded in `logs/argus.log`; the sink test also
 always releases the camera, stops the NanoOWL worker thread, and closes
 its window on exit, even if NanoOWL raises mid-session.

@@ -42,6 +42,7 @@ from nanoowl_logic import (
     TOWEL_EVIDENCE_THRESHOLD,
     WATER_WET_SECONDS,
     TOWEL_CONFIRMATION_SECONDS,
+    MAX_INFERENCE_FPS,
     boxes_connected,
     box_near_any,
     union_box,
@@ -585,6 +586,13 @@ def open_camera():
     if not camera.isOpened():
         return camera
 
+    # Request MJPG before negotiating resolution: many USB cameras only
+    # deliver 30 FPS at 640x480 in their uncompressed default format but
+    # do 60 FPS in MJPG, which raises the ceiling the threaded display
+    # loop can actually hit. Harmless when unsupported - set() just
+    # returns False and the camera keeps its default format.
+    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
     # A capped resolution keeps every per-frame cost (color conversion,
     # PIL conversion, NanoOWL preprocessing, display) proportional to a
     # sane frame size instead of whatever high-res default the driver
@@ -660,10 +668,12 @@ class AsyncOwlPredictor:
     logs) and the worker stops rather than dying silently - the capture
     loop checks error each frame and ends the session cleanly."""
 
-    def __init__(self, loader, tree, threshold):
+    def __init__(self, loader, tree, threshold, max_inference_fps=15):
         self.loader = loader
         self.tree = tree
         self.threshold = threshold
+        self.minimum_interval = 1.0 / max_inference_fps
+        self.last_submit = 0.0
         self.jobs = queue.Queue(maxsize=1)
         self.lock = threading.Lock()
         self.result = None
@@ -684,13 +694,20 @@ class AsyncOwlPredictor:
         return self.ready.is_set() and self.error is None
 
     def submit(self, frame, timestamp):
+        # Cadence cap, mirroring AsyncHandVision's max_inference_fps: the
+        # checklist logic accumulates wall-clock dt, so checking more
+        # often than this buys no responsiveness - it just runs the GPU
+        # hot toward thermal throttling, which lowers the sustained rate.
+        if not self.running:
+            return
+        if timestamp - self.last_submit < self.minimum_interval:
+            return
+        self.last_submit = timestamp
         # Copy: the capture loop draws the HUD onto its frame in place
         # right after submitting, so the worker needs its own snapshot -
         # both so NanoOWL sees clean camera pixels (not a half-drawn
         # overlay) and because result.frame feeds the motion grayscale,
         # which must match what was actually detected.
-        if not self.running:
-            return
         job = (frame.copy(), timestamp)
         try:
             self.jobs.get_nowait()
@@ -770,7 +787,8 @@ def main():
             predictor.encode_owl_text(tree),
         )
 
-    owl = AsyncOwlPredictor(load_nanoowl, tree, DETECTION_THRESHOLD)
+    owl = AsyncOwlPredictor(load_nanoowl, tree, DETECTION_THRESHOLD,
+                            max_inference_fps=MAX_INFERENCE_FPS)
 
     print("Opening camera...")
 
@@ -903,9 +921,14 @@ def main():
             # =====================================================
             # Never blocks: submit() replaces any not-yet-processed job,
             # and latest() just reads whatever AsyncOwlPredictor's worker
-            # thread has finished so far.
+            # thread has finished so far. While the result screen is up
+            # the session is frozen and every prediction would be thrown
+            # away, so don't submit at all - the GPU idles and cools for
+            # those 5 seconds instead of churning toward throttling.
+            # Submission resumes on the automatic reset below.
 
-            owl.submit(frame, now)
+            if monitor["result"] is None:
+                owl.submit(frame, now)
             new_sequence, result = owl.latest()
 
             if result is not None and new_sequence != processed_sequence:

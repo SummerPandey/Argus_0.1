@@ -140,6 +140,15 @@ SOAP_EVIDENCE_THRESHOLD = 0.18
 WATER_EVIDENCE_THRESHOLD = 0.15
 TOWEL_EVIDENCE_THRESHOLD = 0.15
 
+# Ceiling on how often frames are handed to the NanoOWL worker. The
+# checklist logic is dt-accumulated wall-clock time, so it's cadence-
+# independent; anything past ~15 checks per second buys no responsiveness
+# and just heats the Jetson toward thermal throttling, which slows the
+# sustained rate. Set higher (or lower) per-device via config.json. Room
+# hand test applies the same idea to MediaPipe (bubbles/camera.py's
+# max_inference_fps).
+MAX_INFERENCE_FPS = 15.0
+
 
 # =========================================================
 # GEOMETRY HELPERS
@@ -556,6 +565,7 @@ TUNABLE_DEFAULTS = {
     "SOAP_EVIDENCE_THRESHOLD": SOAP_EVIDENCE_THRESHOLD,
     "WATER_EVIDENCE_THRESHOLD": WATER_EVIDENCE_THRESHOLD,
     "TOWEL_EVIDENCE_THRESHOLD": TOWEL_EVIDENCE_THRESHOLD,
+    "MAX_INFERENCE_FPS": MAX_INFERENCE_FPS,
 }
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
