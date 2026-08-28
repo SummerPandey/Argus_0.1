@@ -3,6 +3,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import numpy as np
 import PIL.Image
 
@@ -610,18 +611,30 @@ def open_camera():
 # created it, and getting that wrong is a crash, not just a slowdown.
 #
 # AsyncOwlPredictor applies the same pattern Room mode already uses,
-# safely, because it keeps that rule explicit: exactly one worker thread
-# is ever created, and it is the only thread that ever calls predict() -
-# the capture loop only calls submit()/latest(). Frames are dropped, not
-# queued (maxsize=1, get_nowait+put_nowait), so a slow inference cycle
-# skips stale frames instead of building a backlog.
+# safely, because it keeps that rule explicit and total: the one worker
+# thread runs the loader (engine deserialization + text encoding) and is
+# then the only thread that ever calls predict(), so the CUDA/TensorRT
+# context is created and used by a single thread for its entire life. The
+# capture loop only calls submit()/latest()/wait_ready()/close(), none of
+# which touch CUDA. Frames are dropped, not queued (maxsize=1,
+# get_nowait+put_nowait), so a slow inference cycle skips stale frames
+# instead of building a backlog, and submit() hands the worker a copy of
+# the frame because the capture loop draws the HUD onto its own frame in
+# place afterwards - NanoOWL must see clean camera pixels, and the frame
+# stored in the result feeds the motion grayscale downstream.
 #
-# This has only been verified by reading the code and by the fact that
-# nanoowl_logic.py's decision-logic tests are untouched (nothing about the
-# WHO-timing math changed, only when it runs) - actually exercising this
-# against the NanoOWL/TensorRT engine on a Jetson has not been done here,
-# since neither is available in this environment. Treat it as unverified
-# on real hardware until it's been run on-device.
+# If loading or a prediction raises, the error is recorded on self.error
+# (with the full traceback printed for the console/argus.log) and the
+# worker stops; main()'s loop checks error every frame and ends the
+# session with a visible message instead of freezing on a stale result.
+#
+# The threading mechanics here (single caller thread, frame isolation,
+# drop-not-queue, error surfacing, prompt shutdown) are pinned down by
+# tests/test_async_owl.py against a fake predictor. What is NOT verified
+# is the real thing: exercising this against the NanoOWL/TensorRT engine
+# on a Jetson has not been done here, since neither is available in this
+# environment. Treat it as unverified on real hardware until it's been
+# run on-device.
 class OwlResult:
     """One completed NanoOWL prediction, paired with the exact frame and
     capture timestamp it was computed from - so motion/geometry code
@@ -637,31 +650,54 @@ class OwlResult:
 
 
 class AsyncOwlPredictor:
-    """Runs TreePredictor.predict() on a single dedicated worker thread
-    instead of the main capture loop, so a slow TensorRT cycle no longer
-    blocks camera reads or the display window."""
+    """Owns NanoOWL end to end on one dedicated worker thread.
 
-    def __init__(self, predictor, tree, threshold, clip_encodings, owl_encodings):
-        self.predictor = predictor
+    The worker runs `loader` (engine load + text encoding) and is then
+    the only thread that ever calls predict(), so the CUDA/TensorRT
+    context is created and used by a single thread for its whole life.
+    `tree` is plain-Python prompt data, shared read-only. If loading or
+    a prediction raises, self.error is set (traceback printed for the
+    logs) and the worker stops rather than dying silently - the capture
+    loop checks error each frame and ends the session cleanly."""
+
+    def __init__(self, loader, tree, threshold):
+        self.loader = loader
         self.tree = tree
         self.threshold = threshold
-        self.clip_encodings = clip_encodings
-        self.owl_encodings = owl_encodings
         self.jobs = queue.Queue(maxsize=1)
         self.lock = threading.Lock()
         self.result = None
         self.sequence = 0
+        self.error = None
+        self.ready = threading.Event()
         self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread = threading.Thread(
+            target=self._run, name="nanoowl-worker", daemon=True
+        )
         self.thread.start()
 
+    def wait_ready(self, timeout=None):
+        """Block until the worker has finished loading NanoOWL. True when
+        ready to predict; False (with self.error set) when loading failed
+        or hasn't finished within `timeout` seconds."""
+        self.ready.wait(timeout)
+        return self.ready.is_set() and self.error is None
+
     def submit(self, frame, timestamp):
+        # Copy: the capture loop draws the HUD onto its frame in place
+        # right after submitting, so the worker needs its own snapshot -
+        # both so NanoOWL sees clean camera pixels (not a half-drawn
+        # overlay) and because result.frame feeds the motion grayscale,
+        # which must match what was actually detected.
+        if not self.running:
+            return
+        job = (frame.copy(), timestamp)
         try:
             self.jobs.get_nowait()
         except queue.Empty:
             pass
         try:
-            self.jobs.put_nowait((frame, timestamp))
+            self.jobs.put_nowait(job)
         except queue.Full:
             pass
 
@@ -669,19 +705,35 @@ class AsyncOwlPredictor:
         with self.lock:
             return self.sequence, self.result
 
+    def _fail(self, stage, exc):
+        traceback.print_exc()
+        self.error = f"NanoOWL {stage} failed: {exc}"
+        self.running = False
+
     def _run(self):
+        try:
+            predictor, clip_encodings, owl_encodings = self.loader()
+        except Exception as exc:
+            self._fail("load", exc)
+            self.ready.set()
+            return
+        self.ready.set()
         while self.running:
             try:
                 frame, timestamp = self.jobs.get(timeout=.2)
             except queue.Empty:
                 continue
-            output = self.predictor.predict(
-                cv2_to_pil(frame),
-                tree=self.tree,
-                threshold=self.threshold,
-                clip_text_encodings=self.clip_encodings,
-                owl_text_encodings=self.owl_encodings,
-            )
+            try:
+                output = predictor.predict(
+                    cv2_to_pil(frame),
+                    tree=self.tree,
+                    threshold=self.threshold,
+                    clip_text_encodings=clip_encodings,
+                    owl_text_encodings=owl_encodings,
+                )
+            except Exception as exc:
+                self._fail("inference", exc)
+                return
             with self.lock:
                 self.result = OwlResult(output, frame, timestamp)
                 self.sequence += 1
@@ -694,28 +746,31 @@ class AsyncOwlPredictor:
 def main():
 
     # =========================================================
-    # LOAD NANOOWL
+    # LOAD NANOOWL + OPEN CAMERA
     # =========================================================
+    # The Tree is plain-Python prompt parsing and is shared read-only with
+    # the worker. Everything CUDA/TensorRT - engine deserialization, text
+    # encoding, inference - happens on AsyncOwlPredictor's single worker
+    # thread via the loader below, so one thread owns that context for its
+    # entire life. The camera opens while the engine loads, then
+    # wait_ready() holds until NanoOWL is actually usable (or reports
+    # exactly why it isn't, instead of a bare thread crash).
 
     print("Loading NanoOWL...")
 
-    predictor = TreePredictor(
-        owl_predictor=OwlPredictor(image_encoder_engine=(ENGINE_PATH))
-    )
-
     tree = Tree.from_prompt(PROMPT)
 
-    clip_encodings = predictor.encode_clip_text(tree)
+    def load_nanoowl():
+        predictor = TreePredictor(
+            owl_predictor=OwlPredictor(image_encoder_engine=(ENGINE_PATH))
+        )
+        return (
+            predictor,
+            predictor.encode_clip_text(tree),
+            predictor.encode_owl_text(tree),
+        )
 
-    owl_encodings = predictor.encode_owl_text(tree)
-
-    print("NanoOWL loaded.")
-
-    print("Prompt:", PROMPT)
-
-    # =========================================================
-    # OPEN CAMERA
-    # =========================================================
+    owl = AsyncOwlPredictor(load_nanoowl, tree, DETECTION_THRESHOLD)
 
     print("Opening camera...")
 
@@ -723,23 +778,21 @@ def main():
 
     if not camera.isOpened():
 
+        owl.close()
+
         print(f"Could not open " f"/dev/video{CAMERA_ID}")
 
         print("Try changing " "CAMERA_ID to 1.")
 
         raise SystemExit
 
-    # =========================================================
-    # NANOOWL WORKER
-    # =========================================================
-    # Inference now runs on its own thread (see AsyncOwlPredictor above) so
-    # a slow TensorRT cycle no longer blocks camera reads or cv2.imshow -
-    # only the boxes/checklist lag a frame or two behind, the same
-    # tradeoff Room hand test already makes for MediaPipe.
+    if not owl.wait_ready():
+        camera.release()
+        raise SystemExit(owl.error or "NanoOWL did not finish loading.")
 
-    owl = AsyncOwlPredictor(
-        predictor, tree, DETECTION_THRESHOLD, clip_encodings, owl_encodings
-    )
+    print("NanoOWL loaded.")
+
+    print("Prompt:", PROMPT)
 
     # =========================================================
     # MAIN VARIABLES
@@ -800,6 +853,16 @@ def main():
 
     try:
         while True:
+
+            # =====================================================
+            # WORKER HEALTH
+            # =====================================================
+            # A dead inference thread must end the session with a visible
+            # message, never leave the HUD frozen on its last result.
+
+            if owl.error is not None:
+                print(owl.error)
+                break
 
             # =====================================================
             # READ CAMERA
@@ -1502,6 +1565,8 @@ def main():
 
                 clear_detection_state()
 
+                print("Monitor reset.")
+
             # =====================================================
             # CALIBRATION TOGGLE
             # =====================================================
@@ -1509,8 +1574,6 @@ def main():
             if key == ord("c"):
 
                 calibration = not calibration
-
-                print("Monitor reset.")
 
             # W/N/D/F are a manual FALLBACK only. Wet/rinse/dry/faucet-closed
             # are normally auto-detected from water/towel/faucet evidence

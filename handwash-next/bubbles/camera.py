@@ -4,6 +4,7 @@ import argparse
 import queue
 import threading
 import time
+import traceback
 
 from .session import Observation, SessionEngine, Stage
 from .vision import HandVision, VisionResult
@@ -29,11 +30,20 @@ class LatestFrameCamera:
         self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.camera_id = selected
         self.frames, self.running, self.error = queue.Queue(maxsize=1), True, None
-        threading.Thread(target=self._capture, daemon=True).start()
+        threading.Thread(target=self._capture, name="camera-capture",
+                         daemon=True).start()
 
     def _capture(self):
         while self.running:
-            ok, frame = self.capture.read()
+            # A raising read() (driver/USB fault mid-session) must surface
+            # as an error the main loop can report, not kill this thread
+            # silently and leave the window waiting on frames forever.
+            try:
+                ok, frame = self.capture.read()
+            except Exception as exc:
+                traceback.print_exc()
+                self.error, self.running = f"Camera failed: {exc}", False
+                break
             if not ok:
                 self.error, self.running = "Camera stopped returning frames", False
                 break
@@ -69,8 +79,10 @@ class AsyncHandVision:
         self.lock = threading.Lock()
         self.result = VisionResult(Observation(0), tuple(), 0, 0, 0, 0)
         self.sequence = 0
+        self.error = None
         self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread = threading.Thread(target=self._run, name="hand-vision",
+                                       daemon=True)
         self.thread.start()
 
     def submit(self, frame, timestamp):
@@ -100,8 +112,16 @@ class AsyncHandVision:
                 frame, timestamp = self.jobs.get(timeout=.2)
             except queue.Empty:
                 continue
-            result = self.vision.process(frame, timestamp, self.cv2, self.np,
-                                         detect_foam=self.detect_foam)
+            # A raising process() (e.g. a MediaPipe timestamp error) must
+            # surface as an error the main loop can report, not kill this
+            # thread silently and freeze the HUD on its last result.
+            try:
+                result = self.vision.process(frame, timestamp, self.cv2, self.np,
+                                             detect_foam=self.detect_foam)
+            except Exception as exc:
+                traceback.print_exc()
+                self.error, self.running = f"Hand tracking failed: {exc}", False
+                break
             with self.lock:
                 self.result = result
                 self.sequence += 1
@@ -216,8 +236,15 @@ def main():
     state = engine.snapshot(False)
     fps, frames, fps_at, debug = 0.0, 0, time.monotonic(), False
     try:
-        while camera.running:
-            frame, now = camera.latest(), time.monotonic()
+        while camera.running and vision.running:
+            # A capture thread that dies right after the running check
+            # shows up here as an empty queue - loop back around so the
+            # while condition (and the error report below) handle it.
+            try:
+                frame = camera.latest()
+            except queue.Empty:
+                continue
+            now = time.monotonic()
             vision.submit(frame, now)
             new_sequence, newest = vision.latest()
             if new_sequence != vision_sequence:
@@ -248,6 +275,13 @@ def main():
         vision.close()
         camera.close()
         cv2.destroyAllWindows()
+
+    # Surface a worker-thread failure as the exit message (and a nonzero
+    # exit code the launcher can log) instead of quitting silently as if
+    # the user had pressed Q.
+    failure = camera.error or vision.error
+    if failure:
+        raise SystemExit(failure)
 
 
 if __name__ == "__main__":

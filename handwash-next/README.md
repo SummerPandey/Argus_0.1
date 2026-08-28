@@ -109,19 +109,36 @@ This was previously left synchronous on purpose: threading NanoOWL's
 context, which is easy to get subtly wrong (crashes, not just slowness),
 and this repo doesn't have access to the Jetson + camera + NanoOWL engine
 needed to run it for real. `AsyncOwlPredictor` keeps the one rule that
-matters explicit and enforced by construction — exactly one thread is ever
-created, and it is the only thread that ever calls `predict()` — and the
-decision logic in `nanoowl_logic.py` (the WHO timing, checkpoint
-debouncing) is completely unchanged, only *when* it runs per NanoOWL
-result rather than per camera frame. The threading/queue mechanics were
-exercised with a stubbed-out fake predictor (confirming `predict()` is
-never called from more than one thread and that frames are dropped, not
-queued, under load), but actually running this against the real
-NanoOWL/TensorRT engine on a Jetson has not been done here. Treat it as
-unverified on real hardware until it's been run on-device — watch for
-anything CUDA/TensorRT related in `logs/argus.log` or a crash instead of a
-clean exit the first time you run it live, and revert to a synchronous
-`predictor.predict()` call in the capture loop if so.
+matters enforced by construction: its single worker thread runs the
+engine load and text encoding itself and is then the only thread that
+ever calls `predict()`, so the CUDA/TensorRT context is created and used
+by one thread for its entire life (as a side effect, the camera now opens
+while the engine loads instead of after). Submitted frames are copied, so
+the HUD the capture loop draws in place never contaminates what NanoOWL
+or the motion detector sees. And a worker failure is never silent: an
+exception while loading or predicting lands on `.error` with its
+traceback printed for `logs/argus.log`, the capture loop checks it every
+frame, and the session ends with that message instead of freezing on a
+stale result. The same error surfacing was added to Room hand test's
+camera and MediaPipe workers in `bubbles/camera.py`. The decision logic
+in `nanoowl_logic.py` (WHO timing, checkpoint debouncing) is completely
+unchanged — only *when* it runs, per NanoOWL result rather than per
+camera frame.
+
+All of that is covered by tests that run anywhere:
+`tests/test_async_owl.py` pins the worker mechanics against a fake
+predictor (one caller thread ever, loading included; frames dropped, not
+queued, under load; frame isolation; failures surfacing on `.error`;
+prompt shutdown), `tests/test_camera_threads.py` covers the
+`bubbles/camera.py` worker failure paths, and `tests/test_monitor_loop.py`
+drives the real `main()` loop headlessly end to end — session arms,
+R resets, Q quits, a mid-session inference failure ends the session with
+a message, a load failure exits with the reason. What is *not* covered is
+the only thing that can't be off-device: the real TensorRT engine. Treat
+it as unverified on real hardware until it's been run on a Jetson — watch
+for anything CUDA/TensorRT related in `logs/argus.log` the first time you
+run it live, and revert to a synchronous `predictor.predict()` call in
+the capture loop if so.
 
 Separately, and with no such risk: the camera requests a fixed 640×480
 resolution and a 1-frame driver buffer (`CAP_PROP_BUFFERSIZE`), so
@@ -163,5 +180,9 @@ background-fixture gray) instead of eight unrelated debug colors.
   `config.json` (gitignored) to calibrate on-device
 - `tests/test_session.py`, `tests/test_vision.py`, `tests/test_nanoowl_logic.py`
   — core behavioral tests
+- `tests/test_async_owl.py`, `tests/test_camera_threads.py`,
+  `tests/test_monitor_loop.py` — threading mechanics, worker failure
+  propagation, and a headless end-to-end drive of the sink test's main
+  loop (NanoOWL stubbed via `tests/nanoowl_test_stubs.py`)
 
 This is a prototype, not a certified clinical compliance device.
