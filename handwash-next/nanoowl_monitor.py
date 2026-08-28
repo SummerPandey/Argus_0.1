@@ -80,12 +80,30 @@ ENGINE_PATH = "/opt/nanoowl/data/" "owl_image_encoder_patch32.engine"
 # Real sink test asks NanoOWL to also watch for running water and a towel,
 # so wet/rinse/dry/tap-closed can be auto-detected instead of key presses.
 # Room mode has no water/soap step at all, so it stays hands+forearms only.
-PROMPT = (
-    "[a left hand, a right hand, " "a left forearm, a right forearm]"
+#
+# The sink test's prompt is stage-aware: OWL-ViT's per-frame decode work
+# scales with the number of queries, and no session ever needs soap and a
+# towel at the same time. "active" covers everything up to the end of the
+# 30s rub (soap can only be latched there, and rubbing time can't
+# accumulate without it), then "closing" swaps soap out for the towel and
+# faucet that rinse/dry/tap-off need. Water stays in both, since it drives
+# wet before the rub and rinse after it. Both prompt trees are encoded
+# once at startup - switching stages costs nothing per frame. Label
+# wording is identical across stages so per-device threshold calibration
+# stays meaningful.
+PROMPTS = (
+    {
+        "active": "[a left hand, a right hand, "
+        "a left forearm, a right forearm]",
+    }
     if ROOM_MODE
-    else "[a left hand, a right hand, "
-    "a left forearm, a right forearm, soap foam, "
-    "running water, a towel, a faucet]"
+    else {
+        "active": "[a left hand, a right hand, "
+        "a left forearm, a right forearm, soap foam, running water]",
+        "closing": "[a left hand, a right hand, "
+        "a left forearm, a right forearm, running water, "
+        "a towel, a faucet]",
+    }
 )
 
 
@@ -626,10 +644,16 @@ def open_camera():
 # capture loop only calls submit()/latest()/wait_ready()/close(), none of
 # which touch CUDA. Frames are dropped, not queued (maxsize=1,
 # get_nowait+put_nowait), so a slow inference cycle skips stale frames
-# instead of building a backlog, and submit() hands the worker a copy of
-# the frame because the capture loop draws the HUD onto its own frame in
-# place afterwards - NanoOWL must see clean camera pixels, and the frame
-# stored in the result feeds the motion grayscale downstream.
+# instead of building a backlog. submit() also does the CPU-side
+# preprocessing (BGR->RGB/PIL) and takes a BGR copy on the capture
+# thread: prep of the next frame overlaps GPU inference of the current
+# one, and the worker's input stays isolated from the HUD the capture
+# loop draws onto its own frame in place afterwards - NanoOWL must see
+# clean camera pixels, and the frame stored in the result feeds the
+# motion grayscale downstream. Prompts are stage-aware (see PROMPTS):
+# every profile's tree is encoded once at load, submit() names the
+# profile per frame, and each result carries the tree it was decoded
+# against.
 #
 # If loading or a prediction raises, the error is recorded on self.error
 # (with the full traceback printed for the console/argus.log) and the
@@ -647,14 +671,19 @@ class OwlResult:
     """One completed NanoOWL prediction, paired with the exact frame and
     capture timestamp it was computed from - so motion/geometry code
     downstream always compares matching data instead of whatever the
-    latest live camera frame happens to be by the time the result lands."""
+    latest live camera frame happens to be by the time the result lands.
+    Carries the prompt tree it was predicted against, because prompts are
+    stage-aware: label indices must be resolved against the tree that
+    produced this result, never against whichever stage is current by the
+    time it's read."""
 
-    __slots__ = ("output", "frame", "timestamp")
+    __slots__ = ("output", "frame", "timestamp", "tree")
 
-    def __init__(self, output, frame, timestamp):
+    def __init__(self, output, frame, timestamp, tree):
         self.output = output
         self.frame = frame
         self.timestamp = timestamp
+        self.tree = tree
 
 
 class AsyncOwlPredictor:
@@ -663,14 +692,17 @@ class AsyncOwlPredictor:
     The worker runs `loader` (engine load + text encoding) and is then
     the only thread that ever calls predict(), so the CUDA/TensorRT
     context is created and used by a single thread for its whole life.
-    `tree` is plain-Python prompt data, shared read-only. If loading or
-    a prediction raises, self.error is set (traceback printed for the
-    logs) and the worker stops rather than dying silently - the capture
-    loop checks error each frame and ends the session cleanly."""
+    `trees` maps profile name -> plain-Python prompt tree, shared
+    read-only; the loader returns matching per-profile encodings and
+    submit() picks the profile per frame, so stage switches cost nothing.
+    If loading or a prediction raises, self.error is set (traceback
+    printed for the logs) and the worker stops rather than dying silently
+    - the capture loop checks error each frame and ends the session
+    cleanly."""
 
-    def __init__(self, loader, tree, threshold, max_inference_fps=15):
+    def __init__(self, loader, trees, threshold, max_inference_fps=15):
         self.loader = loader
-        self.tree = tree
+        self.trees = trees
         self.threshold = threshold
         self.minimum_interval = 1.0 / max_inference_fps
         self.last_submit = 0.0
@@ -693,7 +725,7 @@ class AsyncOwlPredictor:
         self.ready.wait(timeout)
         return self.ready.is_set() and self.error is None
 
-    def submit(self, frame, timestamp):
+    def submit(self, frame, timestamp, profile="active"):
         # Cadence cap, mirroring AsyncHandVision's max_inference_fps: the
         # checklist logic accumulates wall-clock dt, so checking more
         # often than this buys no responsiveness - it just runs the GPU
@@ -703,12 +735,15 @@ class AsyncOwlPredictor:
         if timestamp - self.last_submit < self.minimum_interval:
             return
         self.last_submit = timestamp
-        # Copy: the capture loop draws the HUD onto its frame in place
-        # right after submitting, so the worker needs its own snapshot -
-        # both so NanoOWL sees clean camera pixels (not a half-drawn
-        # overlay) and because result.frame feeds the motion grayscale,
-        # which must match what was actually detected.
-        job = (frame.copy(), timestamp)
+        # Preprocess here, on the capture thread, not on the worker: the
+        # BGR->RGB/PIL conversion is pure CPU and the capture loop has
+        # headroom, so doing it here lets the next frame's prep overlap
+        # the GPU inference of the current one instead of serializing
+        # behind it. It also isolates the worker's input from the HUD the
+        # capture loop draws onto its frame in place right after this
+        # (cvtColor allocates a fresh buffer), and the BGR copy keeps
+        # result.frame - which feeds the motion grayscale - clean too.
+        job = (cv2_to_pil(frame), frame.copy(), timestamp, profile)
         try:
             self.jobs.get_nowait()
         except queue.Empty:
@@ -729,7 +764,12 @@ class AsyncOwlPredictor:
 
     def _run(self):
         try:
-            predictor, clip_encodings, owl_encodings = self.loader()
+            predictor, encodings = self.loader()
+            missing = [name for name in self.trees if name not in encodings]
+            if missing:
+                raise ValueError(
+                    f"loader returned no encodings for profiles: {missing}"
+                )
         except Exception as exc:
             self._fail("load", exc)
             self.ready.set()
@@ -737,13 +777,15 @@ class AsyncOwlPredictor:
         self.ready.set()
         while self.running:
             try:
-                frame, timestamp = self.jobs.get(timeout=.2)
+                image, frame, timestamp, profile = self.jobs.get(timeout=.2)
             except queue.Empty:
                 continue
             try:
+                tree = self.trees[profile]
+                clip_encodings, owl_encodings = encodings[profile]
                 output = predictor.predict(
-                    cv2_to_pil(frame),
-                    tree=self.tree,
+                    image,
+                    tree=tree,
                     threshold=self.threshold,
                     clip_text_encodings=clip_encodings,
                     owl_text_encodings=owl_encodings,
@@ -752,7 +794,7 @@ class AsyncOwlPredictor:
                 self._fail("inference", exc)
                 return
             with self.lock:
-                self.result = OwlResult(output, frame, timestamp)
+                self.result = OwlResult(output, frame, timestamp, tree)
                 self.sequence += 1
 
     def close(self):
@@ -775,19 +817,20 @@ def main():
 
     print("Loading NanoOWL...")
 
-    tree = Tree.from_prompt(PROMPT)
+    trees = {name: Tree.from_prompt(prompt) for name, prompt in PROMPTS.items()}
 
     def load_nanoowl():
         predictor = TreePredictor(
             owl_predictor=OwlPredictor(image_encoder_engine=(ENGINE_PATH))
         )
-        return (
-            predictor,
-            predictor.encode_clip_text(tree),
-            predictor.encode_owl_text(tree),
-        )
+        encodings = {
+            name: (predictor.encode_clip_text(tree),
+                   predictor.encode_owl_text(tree))
+            for name, tree in trees.items()
+        }
+        return predictor, encodings
 
-    owl = AsyncOwlPredictor(load_nanoowl, tree, DETECTION_THRESHOLD,
+    owl = AsyncOwlPredictor(load_nanoowl, trees, DETECTION_THRESHOLD,
                             max_inference_fps=MAX_INFERENCE_FPS)
 
     print("Opening camera...")
@@ -810,7 +853,8 @@ def main():
 
     print("NanoOWL loaded.")
 
-    print("Prompt:", PROMPT)
+    for name, prompt in PROMPTS.items():
+        print(f"Prompt [{name}]:", prompt)
 
     # =========================================================
     # MAIN VARIABLES
@@ -926,9 +970,21 @@ def main():
             # away, so don't submit at all - the GPU idles and cools for
             # those 5 seconds instead of churning toward throttling.
             # Submission resumes on the automatic reset below.
+            #
+            # The prompt profile follows the session stage: soap and
+            # water until the 30s rub is done, then the towel and faucet
+            # that rinse/dry/tap-off need (see PROMPTS). One result
+            # already in flight from the old stage may still arrive and
+            # is decoded against its own tree (result.tree below).
 
             if monitor["result"] is None:
-                owl.submit(frame, now)
+                profile = (
+                    "closing"
+                    if not ROOM_MODE
+                    and monitor["rubbing_time"] >= REQUIRED_RUB_TIME
+                    else "active"
+                )
+                owl.submit(frame, now, profile)
             new_sequence, result = owl.latest()
 
             if result is not None and new_sequence != processed_sequence:
@@ -982,7 +1038,7 @@ def main():
                     if box[2] <= box[0] or box[3] <= box[1]:
                         continue
 
-                    label = detection_name(detection, tree)
+                    label = detection_name(detection, result.tree)
 
                     if len(detection.scores) > 0:
 

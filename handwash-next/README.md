@@ -155,7 +155,16 @@ picks. On the inference side, frames are handed to NanoOWL at most
 `config.json`) and not at all while a result screen is up — the checklist
 logic accumulates wall-clock time, so checking faster buys no
 responsiveness and only heats the Jetson toward thermal throttling, which
-is what actually lowers the sustained rate. Startup failures are
+is what actually lowers the sustained rate. The sink test's prompt is
+also stage-aware: OWL-ViT's decode work scales with the number of
+queries, and no session needs soap and a towel at the same time, so
+NanoOWL watches for soap+water until the 30-second rub is done and then
+swaps to water+towel+faucet for rinse/dry/tap-off (both prompt trees are
+encoded once at startup; each result carries the tree it was decoded
+against, so a stage switch can never mislabel an in-flight result). And
+the CPU-side preprocessing (BGR→RGB/PIL) happens on the capture thread at
+submit time rather than on the inference thread, so prep of the next
+frame overlaps GPU inference of the current one. Startup failures are
 shown in a dialog and recorded in `logs/argus.log`; the sink test also
 always releases the camera, stops the NanoOWL worker thread, and closes
 its window on exit, even if NanoOWL raises mid-session.

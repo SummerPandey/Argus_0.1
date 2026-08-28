@@ -56,6 +56,7 @@ class FakePredictor:
         self.fail = fail
         self.calls = 0
         self.caller_threads = set()
+        self.trees_seen = []
         self.lock = threading.Lock()
 
     def predict(self, image, tree, threshold, clip_text_encodings,
@@ -63,6 +64,7 @@ class FakePredictor:
         with self.lock:
             self.calls += 1
             self.caller_threads.add(threading.get_ident())
+            self.trees_seen.append(tree)
         if self.fail:
             raise RuntimeError("simulated TensorRT failure")
         if self.delay:
@@ -70,16 +72,21 @@ class FakePredictor:
         return types.SimpleNamespace(detections=[])
 
 
-def _make_owl(predictor, loader_threads=None, max_inference_fps=10_000):
+def _make_owl(predictor, loader_threads=None, max_inference_fps=10_000,
+              trees=None):
+    trees = {"active": object()} if trees is None else trees
+
     def loader():
         if loader_threads is not None:
             loader_threads.add(threading.get_ident())
-        return predictor, "clip-encodings", "owl-encodings"
+        return predictor, {
+            name: ("clip-encodings", "owl-encodings") for name in trees
+        }
 
     # A very high default fps cap keeps these mechanics tests about the
     # queue/thread behavior; the cap itself has its own dedicated test.
     return nanoowl_monitor.AsyncOwlPredictor(
-        loader, tree=object(), threshold=0.1,
+        loader, trees=trees, threshold=0.1,
         max_inference_fps=max_inference_fps,
     )
 
@@ -143,11 +150,47 @@ class AsyncOwlPredictorTests(unittest.TestCase):
         def loader():
             raise RuntimeError("engine file missing")
 
-        owl = nanoowl_monitor.AsyncOwlPredictor(loader, tree=object(), threshold=0.1)
+        owl = nanoowl_monitor.AsyncOwlPredictor(
+            loader, trees={"active": object()}, threshold=0.1
+        )
         self.assertFalse(owl.wait_ready(timeout=3))
         self.assertIn("engine file missing", owl.error)
         owl.close()
         self.assertFalse(owl.thread.is_alive())
+
+    def test_loader_missing_a_profile_encoding_surfaces_on_error(self):
+        def loader():
+            return FakePredictor(), {"active": ("clip", "owl")}
+
+        owl = nanoowl_monitor.AsyncOwlPredictor(
+            loader,
+            trees={"active": object(), "closing": object()},
+            threshold=0.1,
+        )
+        self.assertFalse(owl.wait_ready(timeout=3))
+        self.assertIn("closing", owl.error)
+        owl.close()
+        self.assertFalse(owl.thread.is_alive())
+
+    def test_results_are_predicted_and_tagged_with_the_submitted_profile(self):
+        trees = {"active": object(), "closing": object()}
+        predictor = FakePredictor()
+        owl = _make_owl(predictor, trees=trees)
+        try:
+            self.assertTrue(owl.wait_ready(timeout=3))
+            owl.submit(_frame(), 10.0)  # default profile: "active"
+            self.assertTrue(_wait_for(lambda: owl.latest()[1] is not None))
+            _, result = owl.latest()
+            self.assertIs(result.tree, trees["active"])
+            self.assertIs(predictor.trees_seen[-1], trees["active"])
+
+            owl.submit(_frame(), 11.0, "closing")
+            self.assertTrue(_wait_for(lambda: owl.latest()[0] == 2))
+            _, result = owl.latest()
+            self.assertIs(result.tree, trees["closing"])
+            self.assertIs(predictor.trees_seen[-1], trees["closing"])
+        finally:
+            owl.close()
 
     def test_prediction_failure_surfaces_on_error(self):
         owl = _make_owl(FakePredictor(fail=True))
