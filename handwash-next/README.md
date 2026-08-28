@@ -164,7 +164,20 @@ encoded once at startup; each result carries the tree it was decoded
 against, so a stage switch can never mislabel an in-flight result). And
 the CPU-side preprocessing (BGR→RGB/PIL) happens on the capture thread at
 submit time rather than on the inference thread, so prep of the next
-frame overlaps GPU inference of the current one. Startup failures are
+frame overlaps GPU inference of the current one.
+
+None of that outweighs the board itself: a Jetson in a default power mode
+with governed clocks routinely gives up 30–50% of sustained TensorRT
+throughput before any code runs. `./jetson-performance.sh` reports the
+current power mode, this device's own mode table, and temperatures;
+`sudo ./jetson-performance.sh --max` switches to the device's MAXN-class
+mode (never a hardcoded id — the right id differs per Jetson model, and
+on boards with no MAXN it lists the modes for an explicit
+`--set ID` instead) and locks clocks with `jetson_clocks`. The power mode
+persists across reboots; the clock lock does not, so re-run it after
+booting. `run_nanoowl.sh` prints a one-line hint at launch if a faster
+mode is available, and stays silent when the board is already at its best
+(or isn't a Jetson at all). Startup failures are
 shown in a dialog and recorded in `logs/argus.log`; the sink test also
 always releases the camera, stops the NanoOWL worker thread, and closes
 its window on exit, even if NanoOWL raises mid-session.
@@ -197,11 +210,15 @@ background-fixture gray) instead of eight unrelated debug colors.
   `TUNABLE_DEFAULTS` and `load_config()` for on-device calibration.
 - `config.example.json` — every tunable threshold and its default; copy to
   `config.json` (gitignored) to calibrate on-device
+- `jetson-performance.sh` — report/set the Jetson's power mode and lock
+  clocks for maximum sustained inference; safe no-op off-Jetson
 - `tests/test_session.py`, `tests/test_vision.py`, `tests/test_nanoowl_logic.py`
   — core behavioral tests
 - `tests/test_async_owl.py`, `tests/test_camera_threads.py`,
   `tests/test_monitor_loop.py` — threading mechanics, worker failure
   propagation, and a headless end-to-end drive of the sink test's main
   loop (NanoOWL stubbed via `tests/nanoowl_test_stubs.py`)
+- `tests/test_jetson_performance.py` — jetson-performance.sh behavior
+  against fake nvpmodel/jetson_clocks binaries
 
 This is a prototype, not a certified clinical compliance device.

@@ -16,6 +16,14 @@ if [ ! -e /dev/video0 ] && [ ! -e /dev/video1 ]; then
     exit 1
 fi
 
+# Advisory only, never fatal: prints a single hint if this Jetson has a
+# faster power mode available than the one it is in (TensorRT throughput
+# is gated hard by power mode + clocks), and stays silent otherwise.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$SCRIPT_DIR/jetson-performance.sh" ]; then
+    "$SCRIPT_DIR/jetson-performance.sh" --check || true
+fi
+
 ARGS=()
 if [ "$MODE" = "--room" ]; then
     ARGS=(--room)
