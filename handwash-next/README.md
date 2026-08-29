@@ -67,6 +67,16 @@ engine, none of which are available in a plain dev environment. Two things
 make tuning that on your actual sink straightforward instead of a
 code-editing chore:
 
+- The HUD header shows two frame rates side by side — `30 FPS | OWL 15`
+  in the sink test, `30 FPS | MP 15` in Room mode. The left number is how
+  smooth the video is; the right is how often detection actually updates.
+  They are deliberately different numbers now that inference runs on its
+  own thread, and watching them diverge is the quickest way to see where
+  a slowdown really is: a low left number means the camera or display is
+  the problem, a low right number means inference is (or that it's
+  intentionally paused — the sink test reads `OWL 0` during a result
+  screen). Use it to measure the effect of `jetson-performance.sh --max`
+  and of `MAX_INFERENCE_FPS`.
 - Press **`C`** to toggle a live calibration readout — raw detection scores
   for soap/water/towel next to their thresholds, plus the auto-detection
   state (wet timer, rinse latch, dry-frame count). It's the same

@@ -156,7 +156,8 @@ def draw_landmarks(frame, result, cv2):
         cv2.circle(frame, b, 7, (167, 208, 69), -1, cv2.LINE_AA)
 
 
-def draw_panel(frame, state, vision, fps, auto_soap, room_mode, debug, cv2):
+def draw_panel(frame, state, vision, fps, auto_soap, room_mode, debug, cv2,
+               inference_fps=0.0):
     height, width = frame.shape[:2]
     right = min(width-14, 626)
     overlay = frame.copy()
@@ -198,7 +199,11 @@ def draw_panel(frame, state, vision, fps, auto_soap, room_mode, debug, cv2):
                (167, 208, 69) if (state.soap_seen or room_mode) else (120, 135, 135), -1)
     cv2.putText(frame, soap, (194, 140), cv2.FONT_HERSHEY_SIMPLEX,
                 .38, (202, 221, 217), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"{fps:02.0f} FPS", (right-74, 140), cv2.FONT_HERSHEY_SIMPLEX,
+    # Display rate and landmark-inference rate: they run independently
+    # (AsyncHandVision is capped at max_inference_fps), so one number
+    # would hide which of the two is actually struggling.
+    cv2.putText(frame, f"{fps:02.0f} FPS | MP {inference_fps:02.0f}",
+                (right-146, 140), cv2.FONT_HERSHEY_SIMPLEX,
                 .38, (135, 166, 164), 1, cv2.LINE_AA)
 
     controls = "R  RESET     D  DETAILS     Q  QUIT"
@@ -240,6 +245,7 @@ def main():
     result = VisionResult(Observation(0), tuple(), 0, 0, 0, 0)
     state = engine.snapshot(False)
     fps, frames, fps_at, debug = 0.0, 0, time.monotonic(), False
+    inference_fps, inference_frames = 0.0, 0
     try:
         while camera.running and vision.running:
             # A capture thread that dies right after the running check
@@ -254,6 +260,7 @@ def main():
             new_sequence, newest = vision.latest()
             if new_sequence != vision_sequence:
                 vision_sequence, result = new_sequence, newest
+                inference_frames += 1
                 soap = result.observation.soap_confidence if auto_soap and not args.room else 0.0
                 soap = 1.0 if now < manual_soap_until else soap
                 state = engine.update(Observation(result.observation.timestamp,
@@ -261,9 +268,12 @@ def main():
                                                   result.observation.rubbing_confidence, soap))
             frames += 1
             if now-fps_at >= 1:
-                fps, frames, fps_at = frames/(now-fps_at), 0, now
+                elapsed = now-fps_at
+                fps, inference_fps = frames/elapsed, inference_frames/elapsed
+                frames, inference_frames, fps_at = 0, 0, now
             draw_landmarks(frame, result, cv2)
-            draw_panel(frame, state, result, fps, auto_soap, args.room, debug, cv2)
+            draw_panel(frame, state, result, fps, auto_soap, args.room, debug, cv2,
+                       inference_fps)
             cv2.imshow("Argus — Live Hand Hygiene", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

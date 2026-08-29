@@ -53,6 +53,7 @@ from nanoowl_logic import (
     procedure_elapsed,
     missing_checkpoints,
     reset_monitor,
+    FpsMeter,
     advance_wet_evidence,
     advance_rinse_evidence,
     advance_dry_evidence,
@@ -224,7 +225,8 @@ def _progress_bar(frame, top_left, size, fraction, fill_color):
         cv2.rectangle(frame, (x, y), (x + fill_width, y + bar_height), fill_color, -1)
 
 
-def draw_checklist(frame, monitor, separation_elapsed, current_time):
+def draw_checklist(frame, monitor, separation_elapsed, current_time,
+                   display_fps=0.0, inference_fps=0.0):
 
     # Compact top-left card, styled to match the rest of the Argus product.
 
@@ -298,6 +300,25 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         1,
         cv2.LINE_AA,
     )
+
+    # Two rates, because the display and NanoOWL now run independently:
+    # the left number is how smooth the video is, the right is how often
+    # detection actually updates (capped by MAX_INFERENCE_FPS, and 0
+    # while a result screen has inference paused). Seeing them diverge is
+    # the threading working - a single number would hide it.
+    rate_text = f"{display_fps:2.0f} FPS  |  OWL {inference_fps:2.0f}"
+    (rate_w, _), _ = cv2.getTextSize(rate_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+    cv2.putText(
+        frame,
+        rate_text,
+        (x + width - 14 - rate_w, y + 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        TEXT_FAINT,
+        1,
+        cv2.LINE_AA,
+    )
+
     cv2.line(
         frame, (x + 14, y + 68), (x + width - 14, y + 68), PANEL_BORDER, 1, cv2.LINE_AA
     )
@@ -874,6 +895,12 @@ def main():
     # is actually seeing, instead of guessed blind. Nothing here is saved.
     calibration = False
 
+    # Two independent rates, shown side by side in the HUD header: how
+    # smooth the video is, and how often NanoOWL actually delivers a
+    # result. They are no longer the same number.
+    display_rate = FpsMeter()
+    inference_rate = FpsMeter()
+
     # Sequence number of the last AsyncOwlPredictor result actually acted
     # on, and the timestamp (of the frame that produced it) evidence was
     # last integrated up to - both drive delta_time below so WHO timing is
@@ -960,6 +987,8 @@ def main():
 
             now = time.monotonic()
 
+            display_rate.tick(now)
+
             # =====================================================
             # SUBMIT FRAME / COLLECT LATEST NANOOWL RESULT
             # =====================================================
@@ -990,6 +1019,8 @@ def main():
             if result is not None and new_sequence != processed_sequence:
 
                 processed_sequence = new_sequence
+
+                inference_rate.tick(now)
 
                 # This result's own timestamp (from when its frame was
                 # submitted) drives delta_time, so WHO timing reflects real
@@ -1576,7 +1607,8 @@ def main():
             # COMPACT CHECKLIST
             # =====================================================
 
-            draw_checklist(frame, monitor, separation_elapsed, now)
+            draw_checklist(frame, monitor, separation_elapsed, now,
+                           display_rate.rate(now), inference_rate.rate(now))
 
             if calibration:
 

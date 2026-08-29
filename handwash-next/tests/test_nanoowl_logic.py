@@ -16,6 +16,7 @@ from nanoowl_logic import (
     WATER_CONFIRMATION_SECONDS,
     WATER_WET_SECONDS,
     TOWEL_CONFIRMATION_SECONDS,
+    FpsMeter,
     advance_dry_evidence,
     advance_faucet_evidence,
     advance_rinse_evidence,
@@ -438,6 +439,51 @@ class LoadConfigTests(unittest.TestCase):
             path.write_text(json.dumps([1, 2, 3]))
             applied = load_config(path=path)
         self.assertEqual(applied, {})
+
+
+class FpsMeterTests(unittest.TestCase):
+    """Timestamps are caller-supplied, so every case here is exact."""
+
+    def test_no_ticks_reads_zero(self):
+        meter = FpsMeter()
+        self.assertEqual(meter.rate(5.0), 0.0)
+
+    def test_steady_rate_is_measured(self):
+        meter = FpsMeter(window_seconds=2.0)
+        now = 100.0
+        for index in range(120):  # 60 FPS for two full seconds
+            now = 100.0 + index / 60.0
+            meter.tick(now)
+        self.assertAlmostEqual(meter.rate(now), 60.0, delta=1.5)
+
+    def test_reads_correctly_during_the_first_partial_window(self):
+        # Startup must not under-report by dividing a half-second of
+        # samples by the full window.
+        meter = FpsMeter(window_seconds=2.0)
+        now = 0.0
+        for index in range(15):  # 30 FPS for half a second
+            now = index / 30.0
+            meter.tick(now)
+        self.assertAlmostEqual(meter.rate(now), 30.0, delta=3.0)
+
+    def test_rate_decays_toward_zero_once_ticks_stop(self):
+        # The paused-inference case: during a result screen no frames are
+        # submitted, and the HUD must fall to 0 rather than freeze on the
+        # last healthy number.
+        meter = FpsMeter(window_seconds=2.0)
+        for index in range(60):
+            meter.tick(index / 30.0)
+        busy = meter.rate(2.0)
+        self.assertGreater(busy, 20.0)
+        self.assertLess(meter.rate(3.0), busy)
+        self.assertEqual(meter.rate(6.0), 0.0)
+
+    def test_reset_clears_history(self):
+        meter = FpsMeter()
+        for index in range(30):
+            meter.tick(index / 30.0)
+        meter.reset()
+        self.assertEqual(meter.rate(1.0), 0.0)
 
 
 if __name__ == "__main__":

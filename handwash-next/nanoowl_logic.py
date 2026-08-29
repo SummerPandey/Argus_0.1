@@ -15,6 +15,7 @@ is an optional local config.json read at startup for threshold calibration
 from __future__ import annotations
 
 import json
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -247,6 +248,57 @@ def motion_ratio(current_gray, previous_gray, roi):
     difference = cv2.absdiff(current_roi, previous_roi)
     changed = difference >= MOTION_PIXEL_THRESHOLD
     return float(np.count_nonzero(changed)) / changed.size
+
+
+# =========================================================
+# FRAME RATE MEASUREMENT
+# =========================================================
+
+
+class FpsMeter:
+    """Rolling frame-rate meter over a fixed wall-clock window.
+
+    Timestamps are supplied by the caller (never read from a clock here),
+    so this is deterministic and unit-testable. The rate divides by the
+    elapsed window rather than by the span between the oldest and newest
+    samples, which matters for the two ways a rate legitimately drops to
+    zero on screen: inference paused during a result screen, and a worker
+    that has stopped. Dividing by the sample span would keep reporting
+    the last healthy rate forever; dividing by the window decays it to 0
+    the way a viewer expects. Before the first full window has elapsed
+    (startup) it divides by the time actually observed, so the reading is
+    correct immediately instead of ramping up from nothing.
+    """
+
+    def __init__(self, window_seconds=2.0):
+        self.window_seconds = window_seconds
+        self.samples = deque()
+        self.first_tick = None
+
+    def reset(self):
+        self.samples.clear()
+        self.first_tick = None
+
+    def tick(self, now):
+        if self.first_tick is None:
+            self.first_tick = now
+        self.samples.append(now)
+        self._prune(now)
+
+    def _prune(self, now):
+        cutoff = now - self.window_seconds
+        while self.samples and self.samples[0] < cutoff:
+            self.samples.popleft()
+
+    def rate(self, now):
+        """Frames per second over the trailing window as of `now`."""
+        if self.first_tick is None:
+            return 0.0
+        self._prune(now)
+        elapsed = min(self.window_seconds, max(0.0, now - self.first_tick))
+        if elapsed <= 0.0:
+            return 0.0
+        return len(self.samples) / elapsed
 
 
 # =========================================================
