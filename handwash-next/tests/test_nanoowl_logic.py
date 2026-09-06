@@ -8,6 +8,8 @@ import numpy as np
 
 import nanoowl_logic
 from nanoowl_logic import (
+    MAX_EVIDENCE_BOX_AREA_RATIO,
+    MIN_EVIDENCE_BOX_AREA_RATIO,
     REQUIRED_RUB_TIME,
     STALL_HINT_SECONDS,
     TECHNIQUE_STEPS,
@@ -16,6 +18,7 @@ from nanoowl_logic import (
     WATER_CONFIRMATION_SECONDS,
     WATER_WET_SECONDS,
     TOWEL_CONFIRMATION_SECONDS,
+    advance_confirmation,
     advance_dry_evidence,
     advance_faucet_evidence,
     advance_rinse_evidence,
@@ -23,9 +26,11 @@ from nanoowl_logic import (
     advance_stall_tracking,
     advance_technique_variation,
     advance_wet_evidence,
+    box_area_ratio,
     box_near_any,
     boxes_connected,
     detection_name,
+    evidence_box_reasonable,
     load_config,
     missing_checkpoints,
     motion_ratio,
@@ -97,13 +102,27 @@ class AutomaticWetEvidenceTests(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertTrue(monitor["wet_confirmed"])
 
-    def test_interrupted_water_resets_the_timer(self):
+    def test_brief_flicker_only_costs_the_missed_time(self):
+        # On-device, one frame routinely drops out even while water is
+        # genuinely running continuously (a hand passing in front of the
+        # stream, a model miss) - that single miss should cost roughly its
+        # own duration, not the several real seconds already accumulated.
         monitor = reset_monitor()
         advance_wet_evidence(monitor, True, dt=2.9)
-        advance_wet_evidence(monitor, False, dt=0.1)  # water drops out
-        confirmed = advance_wet_evidence(monitor, True, dt=0.2)
+        advance_wet_evidence(monitor, False, dt=0.1)  # one flickered frame
+        confirmed = advance_wet_evidence(monitor, True, dt=0.05)
         self.assertFalse(confirmed)
-        self.assertLess(monitor["water_wet_seconds"], WATER_WET_SECONDS)
+        self.assertAlmostEqual(monitor["water_wet_seconds"], 2.85)
+
+    def test_sustained_absence_fully_drains_the_timer(self):
+        # A brief flicker should be tolerated, but water that's genuinely
+        # gone for as long as it was seen must still fully reset progress,
+        # not leave a false long-term memory of it.
+        monitor = reset_monitor()
+        advance_wet_evidence(monitor, True, dt=2.9)
+        confirmed = advance_wet_evidence(monitor, False, dt=2.9)
+        self.assertFalse(confirmed)
+        self.assertEqual(monitor["water_wet_seconds"], 0.0)
 
     def test_does_nothing_once_rubbing_confirmed(self):
         monitor = reset_monitor()
@@ -180,19 +199,65 @@ class AutomaticSoapEvidenceTests(unittest.TestCase):
         self.assertTrue(confirmed)
         self.assertTrue(monitor["soap_seen"])
 
-    def test_interrupted_evidence_resets(self):
+    def test_brief_flicker_only_costs_the_missed_time(self):
+        # Foam is one of the harder things for the detector to hold a
+        # stable box on - a single flickered frame should cost roughly its
+        # own duration, not wipe out everything accumulated so far.
         monitor = reset_monitor()
         advance_soap_evidence(monitor, soap_detected=True, dt=0.9)
         advance_soap_evidence(monitor, soap_detected=False, dt=0.1)
-        confirmed = advance_soap_evidence(monitor, soap_detected=True, dt=0.2)
+        confirmed = advance_soap_evidence(monitor, soap_detected=True, dt=0.05)
         self.assertFalse(confirmed)
-        self.assertFalse(monitor["soap_seen"])
+        self.assertAlmostEqual(monitor["soap_evidence_seconds"], 0.85)
+
+    def test_sustained_absence_fully_drains_the_timer(self):
+        monitor = reset_monitor()
+        advance_soap_evidence(monitor, soap_detected=True, dt=0.9)
+        confirmed = advance_soap_evidence(monitor, soap_detected=False, dt=0.9)
+        self.assertFalse(confirmed)
+        self.assertEqual(monitor["soap_evidence_seconds"], 0.0)
 
     def test_does_nothing_once_already_seen(self):
         monitor = reset_monitor()
         monitor["soap_seen"] = True
         confirmed = advance_soap_evidence(monitor, soap_detected=True, dt=10.0)
         self.assertFalse(confirmed)
+
+
+class AdvanceConfirmationTests(unittest.TestCase):
+    def test_accumulates_while_detected(self):
+        self.assertAlmostEqual(advance_confirmation(1.0, True, 0.5), 1.5)
+
+    def test_unwinds_by_elapsed_time_while_absent(self):
+        self.assertAlmostEqual(advance_confirmation(1.0, False, 0.4), 0.6)
+
+    def test_floors_at_zero_rather_than_going_negative(self):
+        self.assertEqual(advance_confirmation(0.2, False, 1.0), 0.0)
+
+
+class EvidenceBoxReasonableTests(unittest.TestCase):
+    def test_box_area_ratio_of_a_quarter_frame_box(self):
+        # A 50x50 box in a 100x100 frame covers a quarter of it.
+        self.assertAlmostEqual(box_area_ratio((0, 0, 50, 50), (100, 100)), 0.25)
+
+    def test_accepts_a_modestly_sized_box(self):
+        self.assertTrue(evidence_box_reasonable((10, 10, 40, 40), (100, 100)))
+
+    def test_rejects_a_box_spanning_most_of_the_frame(self):
+        # NanoOWL's classic failure mode on amorphous evidence (running
+        # water, soap foam): a box sweeping in background/reflections
+        # instead of the real localized thing.
+        self.assertFalse(evidence_box_reasonable((0, 0, 95, 95), (100, 100)))
+
+    def test_rejects_a_vanishingly_small_box(self):
+        self.assertFalse(evidence_box_reasonable((0, 0, 1, 1), (100, 100)))
+
+    def test_respects_custom_thresholds(self):
+        self.assertTrue(
+            evidence_box_reasonable(
+                (0, 0, 95, 95), (100, 100), min_ratio=0.0, max_ratio=1.0
+            )
+        )
 
 
 class BoxNearAnyTests(unittest.TestCase):

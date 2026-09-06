@@ -41,6 +41,7 @@ from nanoowl_logic import (
     TOWEL_CONFIRMATION_SECONDS,
     boxes_connected,
     box_near_any,
+    evidence_box_reasonable,
     union_box,
     motion_ratio,
     detection_name,
@@ -210,7 +211,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     y = 12
 
     width = min(500, frame.shape[1] - 24)
-    height = 368
+    height = 390
 
     overlay = frame.copy()
     cv2.rectangle(overlay, (x, y), (x + width, y + height), PANEL_BG, -1)
@@ -381,10 +382,53 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     )
 
     # -----------------------------------------------------
+    # RUB COUNTDOWN TIMER
+    # -----------------------------------------------------
+    # A large, bold countdown next to the small progress-bar readout above,
+    # so remaining rub time is readable at a glance from sink distance
+    # instead of only as fine print.
+
+    timer_y = progress_y + 32
+    remaining_rub_time = max(0.0, REQUIRED_RUB_TIME - monitor["rubbing_time"])
+
+    if not monitor["rubbing_confirmed"]:
+        timer_value, timer_color = f"{REQUIRED_RUB_TIME:.0f}s", TEXT_FAINT
+    elif remaining_rub_time <= 0:
+        timer_value, timer_color = "DONE", MINT
+    elif monitor["state"] == "CONTACT_NO_MOTION":
+        timer_value, timer_color = f"{remaining_rub_time:.0f}s", CORAL
+    else:
+        timer_value, timer_color = f"{remaining_rub_time:.0f}s", AMBER
+
+    cv2.putText(
+        frame,
+        "RUB TIMER",
+        (x + 14, timer_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.38,
+        TEXT_MUTED,
+        1,
+        cv2.LINE_AA,
+    )
+    (timer_label_w, _), _ = cv2.getTextSize(
+        "RUB TIMER", cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1
+    )
+    cv2.putText(
+        frame,
+        timer_value,
+        (x + 14 + timer_label_w + 12, timer_y + 3),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        timer_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    # -----------------------------------------------------
     # COACHING / NEXT STEP / SEPARATION WARNING
     # -----------------------------------------------------
 
-    guide_y = progress_y + 38
+    guide_y = timer_y + 28
 
     if monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
         guide_text = "GUIDE: " + technique_prompt(monitor["rubbing_time"])
@@ -755,10 +799,17 @@ def main():
                 # -------------------------------------------------
                 # SOAP / FOAM
                 # -------------------------------------------------
+                # Soap/water/towel are amorphous/transparent enough that
+                # NanoOWL will occasionally sweep a box across most of the
+                # frame instead of the real thing (background, reflections,
+                # a wet countertop) - evidence_box_reasonable drops those
+                # before they can ever be drawn or scored, instead of
+                # showing an oversized box and/or a false "detected" signal.
 
                 if "soap" in label_lower or "foam" in label_lower:
 
-                    soap_detections.append(item)
+                    if evidence_box_reasonable(box, frame.shape):
+                        soap_detections.append(item)
 
                 # -------------------------------------------------
                 # RUNNING WATER
@@ -766,7 +817,8 @@ def main():
 
                 elif "water" in label_lower:
 
-                    water_detections.append(item)
+                    if evidence_box_reasonable(box, frame.shape):
+                        water_detections.append(item)
 
                 # -------------------------------------------------
                 # TOWEL
@@ -774,7 +826,8 @@ def main():
 
                 elif "towel" in label_lower:
 
-                    towel_detections.append(item)
+                    if evidence_box_reasonable(box, frame.shape):
+                        towel_detections.append(item)
 
                 # -------------------------------------------------
                 # FAUCET

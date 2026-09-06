@@ -140,6 +140,16 @@ SOAP_EVIDENCE_THRESHOLD = 0.18
 WATER_EVIDENCE_THRESHOLD = 0.15
 TOWEL_EVIDENCE_THRESHOLD = 0.15
 
+# Open-vocabulary detection of amorphous/transparent things (running water,
+# soap foam) is prone to a failure mode solid objects like hands rarely hit:
+# a box that balloons to cover a big chunk of the frame - background
+# reflections, glare, or wet countertop all get swept in. That's both a
+# misleadingly huge on-screen box and a false "detected" signal not
+# actually localized at the sink. Real evidence should be a modest patch of
+# the frame, not a sliver either - so both ends are bounded.
+MIN_EVIDENCE_BOX_AREA_RATIO = 0.0015
+MAX_EVIDENCE_BOX_AREA_RATIO = 0.35
+
 
 # =========================================================
 # GEOMETRY HELPERS
@@ -167,6 +177,28 @@ def box_near_any(box, other_boxes, padding):
     `other_boxes`. Used to require water/soap evidence be near the hands
     actually in frame, not just present anywhere in the picture."""
     return any(boxes_connected(box, other, padding) for other in other_boxes)
+
+
+def box_area_ratio(box, frame_shape):
+    height, width = frame_shape[:2]
+    frame_area = max(1.0, float(width) * float(height))
+    x1, y1, x2, y2 = box
+    box_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return box_area / frame_area
+
+
+def evidence_box_reasonable(
+    box,
+    frame_shape,
+    min_ratio=MIN_EVIDENCE_BOX_AREA_RATIO,
+    max_ratio=MAX_EVIDENCE_BOX_AREA_RATIO,
+):
+    """Reject a detection box that's implausible for a localized piece of
+    evidence (soap foam, running water, a towel). Oversized boxes are
+    almost always a false trigger sweeping in background/reflections
+    rather than the real thing; vanishingly small ones are noise."""
+    ratio = box_area_ratio(box, frame_shape)
+    return min_ratio <= ratio <= max_ratio
 
 
 def union_box(boxes, frame_shape, padding=0):
@@ -334,14 +366,29 @@ def missing_checkpoints(monitor, room_mode=False):
     return [name for name, complete in checks if not complete]
 
 
+def advance_confirmation(current, detected, dt):
+    """Leaky-bucket timer for a "seen continuously for N seconds" gate:
+    accumulates dt while evidence is present, and only unwinds by the
+    elapsed time while it's absent, instead of resetting to zero the
+    instant detection flickers out for a single frame. On-device,
+    open-vocabulary detection routinely drops a box for one frame (a hand
+    passing in front of the stream, a model miss) even while the real
+    evidence is continuously there - a hard reset makes that one frame
+    throw away several real seconds of accumulated progress. A sustained
+    absence still drains the timer at the same rate it built up, so this
+    only buys tolerance for brief flicker, not a false long memory."""
+    return max(0.0, current + dt) if detected else max(0.0, current - dt)
+
+
 def advance_wet_evidence(monitor, water_detected, dt):
     """WHO step 1 (wet hands): auto-confirm once water has been seen
-    continuously for WATER_WET_SECONDS. Returns True the frame this
-    becomes newly confirmed, so the caller can start the WHO clock."""
+    continuously (allowing brief flicker, see advance_confirmation) for
+    WATER_WET_SECONDS. Returns True the frame this becomes newly
+    confirmed, so the caller can start the WHO clock."""
     if monitor["wet_confirmed"] or monitor["rubbing_confirmed"]:
         return False
-    monitor["water_wet_seconds"] = (
-        monitor["water_wet_seconds"] + dt if water_detected else 0.0
+    monitor["water_wet_seconds"] = advance_confirmation(
+        monitor["water_wet_seconds"], water_detected, dt
     )
     if monitor["water_wet_seconds"] >= WATER_WET_SECONDS:
         monitor["wet_confirmed"] = True
@@ -357,14 +404,18 @@ def advance_rinse_evidence(monitor, water_detected, rub_target_reached, dt):
         return False
 
     if not monitor["rinse_water_seen"]:
-        monitor["water_seen_seconds"] = (
-            monitor["water_seen_seconds"] + dt if water_detected else 0.0
+        monitor["water_seen_seconds"] = advance_confirmation(
+            monitor["water_seen_seconds"], water_detected, dt
         )
         if monitor["water_seen_seconds"] >= WATER_CONFIRMATION_SECONDS:
             monitor["rinse_water_seen"] = True
             monitor["water_gone_seconds"] = 0.0
         return False
 
+    # Deliberately a hard reset, not advance_confirmation: this is timing
+    # the tap actually being off. Water blipping back on right after
+    # disappearing means the sink isn't stopped yet, so the "gone" timer
+    # must restart from zero, not just lose a little progress.
     monitor["water_gone_seconds"] = (
         0.0 if water_detected else monitor["water_gone_seconds"] + dt
     )
@@ -380,8 +431,8 @@ def advance_dry_evidence(monitor, towel_detected, dt):
     confirmed."""
     if monitor["dry_confirmed"] or not monitor["rinse_confirmed"]:
         return False
-    monitor["towel_seconds"] = (
-        monitor["towel_seconds"] + dt if towel_detected else 0.0
+    monitor["towel_seconds"] = advance_confirmation(
+        monitor["towel_seconds"], towel_detected, dt
     )
     if monitor["towel_seconds"] >= TOWEL_CONFIRMATION_SECONDS:
         monitor["dry_confirmed"] = True
@@ -403,13 +454,17 @@ def advance_faucet_evidence(monitor, towel_faucet_contact):
 
 def advance_soap_evidence(monitor, soap_detected, dt):
     """WHO step 2 (soap): auto-confirm once soap/foam evidence has been
-    seen continuously for SOAP_CONFIRMATION_SECONDS. `soap_detected`
-    should already reflect the score threshold, armed/wet-confirmed
-    gating, and hand-proximity check - this function only debounces it."""
+    seen continuously (allowing brief flicker, see advance_confirmation)
+    for SOAP_CONFIRMATION_SECONDS. `soap_detected` should already reflect
+    the score threshold, armed/wet-confirmed gating, and hand-proximity
+    check - this function only debounces it. Foam is one of the harder
+    things for an open-vocabulary detector to hold a stable box on, so
+    tolerating a flickered miss instead of discarding all progress on it
+    is what keeps this checkpoint from feeling unreliable in practice."""
     if monitor["soap_seen"]:
         return False
-    monitor["soap_evidence_seconds"] = (
-        monitor["soap_evidence_seconds"] + dt if soap_detected else 0.0
+    monitor["soap_evidence_seconds"] = advance_confirmation(
+        monitor["soap_evidence_seconds"], soap_detected, dt
     )
     if monitor["soap_evidence_seconds"] >= SOAP_CONFIRMATION_SECONDS:
         monitor["soap_seen"] = True
@@ -556,6 +611,8 @@ TUNABLE_DEFAULTS = {
     "SOAP_EVIDENCE_THRESHOLD": SOAP_EVIDENCE_THRESHOLD,
     "WATER_EVIDENCE_THRESHOLD": WATER_EVIDENCE_THRESHOLD,
     "TOWEL_EVIDENCE_THRESHOLD": TOWEL_EVIDENCE_THRESHOLD,
+    "MIN_EVIDENCE_BOX_AREA_RATIO": MIN_EVIDENCE_BOX_AREA_RATIO,
+    "MAX_EVIDENCE_BOX_AREA_RATIO": MAX_EVIDENCE_BOX_AREA_RATIO,
 }
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"

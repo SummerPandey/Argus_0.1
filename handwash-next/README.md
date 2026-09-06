@@ -76,9 +76,33 @@ code-editing chore:
   whatever needs adjusting (only the keys you set are overridden; leave the
   rest out). It's read once at startup, before the camera opens, and every
   tunable — the four auto-detection thresholds, WHO timing, camera
-  resolution, motion sensitivity — lives in one place:
-  `nanoowl_logic.TUNABLE_DEFAULTS`. `config.json` is gitignored on purpose,
-  since it's a per-camera/per-sink calibration, not source.
+  resolution, motion sensitivity, and the evidence-box sanity range below —
+  lives in one place: `nanoowl_logic.TUNABLE_DEFAULTS`. `config.json` is
+  gitignored on purpose, since it's a per-camera/per-sink calibration, not
+  source.
+
+Two structural changes make the water/soap/towel checkpoints hold up
+against real on-device flicker instead of just the raw per-frame score:
+
+- **Evidence boxes are sanity-checked before they're ever scored or
+  drawn.** Amorphous/transparent evidence is NanoOWL's weak spot: instead
+  of a tight box on the actual foam or water stream, it'll sometimes sweep
+  in a big chunk of background, reflections, or wet countertop. A box
+  outside `MIN_EVIDENCE_BOX_AREA_RATIO`/`MAX_EVIDENCE_BOX_AREA_RATIO` (0.15%
+  to 35% of the frame by default) is dropped outright, so an oversized box
+  can't dominate the screen or fake a checkpoint.
+- **The wet/soap/dry confirmation timers are leaky buckets, not hard
+  resets.** Previously, a single frame where the detector missed the
+  water/foam/towel (a hand passing in front of the stream, one bad
+  inference) reset the whole "seen continuously for N seconds" timer back
+  to zero, throwing away everything accumulated. Now a miss only unwinds
+  the timer by its own duration (`nanoowl_logic.advance_confirmation`), so
+  brief flicker costs roughly its own length instead of all prior
+  progress — while evidence that's genuinely absent for as long as it was
+  present still fully resets, so this doesn't create a false memory of
+  soap or water that's actually gone. The rinse checkpoint's "tap is now
+  off" timer is deliberately excluded from this and still resets hard on
+  any water blip, since that one is timing the tap actually being closed.
 
 The guidance follows WHO's 11-step, 40–60 second soap-and-water sequence in
 order — wet, soap, the six rub-technique steps, rinse, dry, tap off with the
@@ -118,10 +142,14 @@ the top of `nanoowl_monitor.py`) matching Room hand test's and the desktop
 launcher's navy/mint/cyan Argus identity, instead of the ad hoc bracket
 checklist and pure red/green result screens it used before: a real ARGUS
 wordmark and mode badge, status dots with checkmarks instead of `[X]`/`[ ]`
-text, an actual progress bar for active-rub time, and detection boxes
-color-coded by what they represent (hands/forearms = brand mint/cyan, soap
-and water and towel = one consistent "evidence" amber, the faucet = a muted
-background-fixture gray) instead of eight unrelated debug colors.
+text, an actual progress bar for active-rub time plus a large "RUB TIMER"
+countdown next to it that's readable at sink distance instead of only as
+fine print, and detection boxes color-coded by what they represent
+(hands/forearms = brand mint/cyan, soap and water and towel = one
+consistent "evidence" amber, the faucet = a muted background-fixture gray)
+instead of eight unrelated debug colors. Evidence boxes implausibly large
+or small for the real thing (see Calibrating detection on-device below)
+are dropped before they're ever drawn.
 
 ## Layout
 
