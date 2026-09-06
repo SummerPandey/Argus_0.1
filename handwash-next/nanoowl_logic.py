@@ -70,6 +70,10 @@ ROI_PADDING = 25
 # Allowed gap between a towel box and a faucet box to count as contact.
 TOWEL_FAUCET_PADDING = 40
 
+# Allowed gap between a hand/forearm box and the faucet box to count as
+# "at the faucet."
+HAND_FAUCET_CONTACT_PADDING = 40
+
 
 # =========================================================
 # MOTION SETTINGS
@@ -177,6 +181,18 @@ def box_near_any(box, other_boxes, padding):
     `other_boxes`. Used to require water/soap evidence be near the hands
     actually in frame, not just present anywhere in the picture."""
     return any(boxes_connected(box, other, padding) for other in other_boxes)
+
+
+def hand_at_faucet(faucet_box, active_boxes, padding=HAND_FAUCET_CONTACT_PADDING):
+    """True if a hand or forearm currently in frame is right at the
+    faucet. Reaching for/touching the faucet is a far more reliable signal
+    that water is being turned on than trying to visually classify the
+    transparent running stream itself - open-vocabulary detectors like
+    NanoOWL are much weaker at the latter. This feeds into water evidence
+    alongside, not instead of, the raw "running water" detection."""
+    if faucet_box is None:
+        return False
+    return box_near_any(faucet_box, active_boxes, padding)
 
 
 def box_area_ratio(box, frame_shape):
@@ -593,6 +609,7 @@ TUNABLE_DEFAULTS = {
     "MAX_FOREARM_GAP": MAX_FOREARM_GAP,
     "ROI_PADDING": ROI_PADDING,
     "TOWEL_FAUCET_PADDING": TOWEL_FAUCET_PADDING,
+    "HAND_FAUCET_CONTACT_PADDING": HAND_FAUCET_CONTACT_PADDING,
     "MOTION_PIXEL_THRESHOLD": MOTION_PIXEL_THRESHOLD,
     "MINIMUM_MOTION_RATIO": MINIMUM_MOTION_RATIO,
     "WATER_WET_SECONDS": WATER_WET_SECONDS,

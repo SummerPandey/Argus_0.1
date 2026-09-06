@@ -1,4 +1,5 @@
 import cv2
+import math
 import sys
 import time
 import numpy as np
@@ -40,8 +41,10 @@ from nanoowl_logic import (
     WATER_WET_SECONDS,
     TOWEL_CONFIRMATION_SECONDS,
     boxes_connected,
+    box_center,
     box_near_any,
     evidence_box_reasonable,
+    hand_at_faucet,
     union_box,
     motion_ratio,
     detection_name,
@@ -549,6 +552,7 @@ def draw_calibration(
     rinse_latch,
     dry_seconds,
     towel_faucet,
+    hand_faucet,
 ):
     """Live, on-screen-only readout of raw detection scores against their
     thresholds, toggled with C. Nothing here is written anywhere - it
@@ -593,7 +597,8 @@ def draw_calibration(
         f"wet-timer {wet_timer:.1f}/{WATER_WET_SECONDS:.1f}s   "
         f"rinse-latch {'Y' if rinse_latch else 'N'}   "
         f"dry-timer {dry_seconds:.1f}/{TOWEL_CONFIRMATION_SECONDS:.1f}s   "
-        f"towel-faucet {'Y' if towel_faucet else 'N'}"
+        f"towel-faucet {'Y' if towel_faucet else 'N'}   "
+        f"hand-faucet {'Y' if hand_faucet else 'N'}"
     )
     cv2.putText(
         frame, line1, (24, top + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.38, TEXT_MUTED, 1, cv2.LINE_AA
@@ -946,10 +951,22 @@ def main():
             # nanoowl_logic's advance_*_evidence functions, called after
             # hand/forearm geometry and rubbing time are settled below.
 
+            # Faucet is picked first so hand-at-faucet contact can feed
+            # into water evidence below: NanoOWL is much more reliable at
+            # a solid object like a faucet than at classifying the
+            # transparent running-water stream itself, so a hand actually
+            # reaching the faucet is treated as water evidence in its own
+            # right, not only the "running water" label.
+            faucet_detection = max(
+                faucet_detections, key=lambda item: item["score"], default=None
+            )
+            faucet_box = faucet_detection["box"] if faucet_detection is not None else None
+            hand_faucet_contact = hand_at_faucet(faucet_box, active_boxes)
+
             water_detection = max(
                 water_detections, key=lambda item: item["score"], default=None
             )
-            water_evidence = (
+            water_label_evidence = (
                 water_detection is not None
                 and water_detection["score"] >= WATER_EVIDENCE_THRESHOLD
                 and monitor["armed"]
@@ -959,6 +976,9 @@ def main():
                         water_detection["box"], active_boxes, HAND_PROXIMITY_PADDING
                     )
                 )
+            )
+            water_evidence = water_label_evidence or (
+                monitor["armed"] and hand_faucet_contact
             )
             if water_detection is not None:
                 draw_box(frame, water_detection["box"], "WATER", AMBER)
@@ -973,11 +993,35 @@ def main():
             if towel_detection is not None:
                 draw_box(frame, towel_detection["box"], "TOWEL", AMBER)
 
-            faucet_detection = max(
-                faucet_detections, key=lambda item: item["score"], default=None
-            )
+            # Faucet box itself flips to the "evidence" amber and gets a
+            # connecting line to the nearest hand/forearm while a hand is
+            # at it, so it's visually obvious on screen *why* water is
+            # being counted even when the running-water stream itself
+            # isn't being picked up.
             if faucet_detection is not None:
-                draw_box(frame, faucet_detection["box"], "FAUCET", FIXTURE)
+                draw_box(
+                    frame,
+                    faucet_detection["box"],
+                    "FAUCET - HAND AT TAP" if hand_faucet_contact else "FAUCET",
+                    AMBER if hand_faucet_contact else FIXTURE,
+                )
+                if hand_faucet_contact:
+                    faucet_center = box_center(faucet_detection["box"])
+                    nearest_box = min(
+                        active_boxes,
+                        key=lambda box: math.hypot(
+                            box_center(box)[0] - faucet_center[0],
+                            box_center(box)[1] - faucet_center[1],
+                        ),
+                    )
+                    cv2.line(
+                        frame,
+                        tuple(int(v) for v in box_center(nearest_box)),
+                        tuple(int(v) for v in faucet_center),
+                        AMBER,
+                        2,
+                        cv2.LINE_AA,
+                    )
 
             towel_faucet_contact = (
                 towel_evidence
@@ -1317,6 +1361,7 @@ def main():
                     monitor["rinse_water_seen"],
                     monitor["towel_seconds"],
                     towel_faucet_contact,
+                    hand_faucet_contact,
                 )
 
             # =====================================================

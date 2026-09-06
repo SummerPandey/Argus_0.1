@@ -81,7 +81,7 @@ code-editing chore:
   gitignored on purpose, since it's a per-camera/per-sink calibration, not
   source.
 
-Two structural changes make the water/soap/towel checkpoints hold up
+Three structural changes make the water/soap/towel checkpoints hold up
 against real on-device flicker instead of just the raw per-frame score:
 
 - **Evidence boxes are sanity-checked before they're ever scored or
@@ -103,6 +103,19 @@ against real on-device flicker instead of just the raw per-frame score:
   soap or water that's actually gone. The rinse checkpoint's "tap is now
   off" timer is deliberately excluded from this and still resets hard on
   any water blip, since that one is timing the tap actually being closed.
+- **A hand at the faucet counts as water evidence in its own right.**
+  Classifying a transparent running-water stream is exactly the kind of
+  thing open-vocabulary detectors are weakest at; a hand reaching the
+  solid faucet object is a far more reliable signal that the tap is being
+  turned on, and NanoOWL is much better at localizing solid objects like a
+  faucet than amorphous ones. `nanoowl_logic.hand_at_faucet()` checks hand/
+  forearm proximity to the faucet box (`HAND_FAUCET_CONTACT_PADDING`, 40px
+  by default) and this is OR'd into the water-evidence signal alongside
+  the raw "running water" label — either one, or both, count. On screen,
+  the faucet box switches from muted gray to the evidence amber and gets a
+  connecting line to the nearest hand while this is active, labeled
+  "FAUCET - HAND AT TAP", so it's visually obvious *why* water is being
+  counted even on a frame where the stream itself isn't picked up.
 
 The guidance follows WHO's 11-step, 40–60 second soap-and-water sequence in
 order — wet, soap, the six rub-technique steps, rinse, dry, tap off with the

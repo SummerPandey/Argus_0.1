@@ -31,6 +31,7 @@ from nanoowl_logic import (
     boxes_connected,
     detection_name,
     evidence_box_reasonable,
+    hand_at_faucet,
     load_config,
     missing_checkpoints,
     motion_ratio,
@@ -258,6 +259,24 @@ class EvidenceBoxReasonableTests(unittest.TestCase):
                 (0, 0, 95, 95), (100, 100), min_ratio=0.0, max_ratio=1.0
             )
         )
+
+
+class HandAtFaucetTests(unittest.TestCase):
+    def test_false_when_no_faucet_detected(self):
+        self.assertFalse(hand_at_faucet(None, [(0, 0, 10, 10)]))
+
+    def test_true_when_a_hand_box_touches_the_faucet_box(self):
+        faucet = (100, 100, 130, 160)
+        hand = (135, 110, 160, 140)  # just past the faucet's right edge
+        self.assertTrue(hand_at_faucet(faucet, [hand], padding=10))
+
+    def test_false_when_no_hand_is_near(self):
+        faucet = (100, 100, 130, 160)
+        hand = (0, 0, 20, 20)
+        self.assertFalse(hand_at_faucet(faucet, [hand], padding=10))
+
+    def test_false_with_no_hands_in_frame(self):
+        self.assertFalse(hand_at_faucet((100, 100, 130, 160), []))
 
 
 class BoxNearAnyTests(unittest.TestCase):
