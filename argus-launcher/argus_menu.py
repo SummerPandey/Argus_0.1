@@ -18,7 +18,7 @@ BORDER = "#EADDBB"
 
 MODULES = [
     ("✦", "Hand Wash", "Soap and rubbing compliance", True),
-    ("⚙", "Equipment", "Equipment monitoring", False),
+    ("⚙", "Equipment", "General tray + stain check", True),
     ("✚", "Surgery", "Procedure monitoring", False),
     ("◈", "Gloves", "Glove compliance", False),
 ]
@@ -99,7 +99,7 @@ class ArgusMenu:
 
         if enabled:
             button = tk.Button(
-                card, text="OPEN", command=self.launch_handwash,
+                card, text="OPEN", command=lambda name=title: self.launch(name),
                 bg=ACCENT, fg="#201708", activebackground="#F2BE51",
                 activeforeground="#201708", relief="flat",
                 font=("DejaVu Sans", 10, "bold"), padx=28, pady=8,
@@ -127,11 +127,16 @@ class ArgusMenu:
     def coming_soon(self, name):
         messagebox.showinfo(name, f"{name} is coming soon.")
 
-    def launch_handwash(self):
-        launcher = os.path.join(INSTALL_DIR, "run_handwash.sh")
+    def launch(self, name):
+        launchers = {
+            "Hand Wash": ("run_handwash.sh", "Argus Hand Wash"),
+            "Equipment": ("run_equipment.sh", "Argus Equipment Scan"),
+        }
+        script, terminal_title = launchers[name]
+        launcher = os.path.join(INSTALL_DIR, script)
         try:
             subprocess.Popen([
-                "gnome-terminal", "--title=Argus Hand Wash", "--",
+                "gnome-terminal", f"--title={terminal_title}", "--",
                 "bash", "-lc", launcher
             ])
         except OSError as exc:

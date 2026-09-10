@@ -15,6 +15,7 @@ handwash-next/.cache/
 # Personal on-device calibration - keep config.example.json as the
 # checked-in template, but not the tuned values for one specific camera/sink.
 handwash-next/config.json
+equipment-next/config.json
 
 # Editor / OS cruft
 *.swp

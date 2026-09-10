@@ -22,10 +22,16 @@ live-camera setup, and the test suite.
   `bubbles/` package (state machine, MediaPipe vision, threaded camera) for
   Room hand test and the simulator; `nanoowl_monitor.py` + `nanoowl_logic.py`
   for the NanoOWL-driven Real sink test. Has the test suite.
+- **`equipment-next/`** — the equipment module's general tier: a
+  configurable bare-minimum tray checklist plus a visual blood/dirt stain
+  screen, built the same way (`equipment_logic.py` unit-testable,
+  `nanoowl_equipment_monitor.py` needs the NanoOWL container). See
+  [`equipment-next/README.md`](equipment-next/README.md) for scope and
+  caveats.
 - **`argus-launcher/`** — the Tkinter desktop dashboard (`argus_menu.py`)
-  that launches `handwash-next/launch.sh`. Also shows placeholder modules
-  for planned features (instrument tracking, sterile-field monitoring) that
-  aren't implemented yet.
+  that launches `handwash-next/launch.sh` and `equipment-next/`'s general
+  scan. Also shows placeholder modules for planned features (procedure
+  monitoring, glove compliance) that aren't implemented yet.
 - **`automatic_rubbing.py`**, **`handwash_test.py`**, **`run_handwash.sh`** —
   the original prototype: a single-file NanoOWL script and an even earlier
   camera-less state machine. Superseded by `handwash-next/nanoowl_monitor.py`
