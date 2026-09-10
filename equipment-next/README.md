@@ -66,11 +66,41 @@ actual tray, lighting, and camera rather than editing the source.
   blood/dirt contamination heuristic, kept free of NanoOWL/camera
   dependencies so it's unit tested anywhere. Also owns `TUNABLE_DEFAULTS`
   and `load_config()`.
-- `nanoowl_equipment_monitor.py` — camera capture, drawing, and the
-  scan loop's `main()` entry point (needs the NanoOWL/TensorRT container
-  to import or run, so it isn't covered by the test suite).
+- `equipment_hud.py` — the on-screen checklist card (rounded panel, status
+  dots, result pill, detection-box label chips), also kept free of the
+  `nanoowl` import so its look can be rendered to an image and checked
+  without a Jetson - see "Checking the look without a Jetson" below.
+- `nanoowl_equipment_monitor.py` — camera capture and the scan loop's
+  `main()` entry point, built on the two modules above (needs the
+  NanoOWL/TensorRT container to import or run, so it isn't covered by the
+  test suite).
 - `config.example.json` — every tunable and its default; copy to
   `config.json` (gitignored) to calibrate on-device.
-- `tests/test_equipment_logic.py` — the logic module's test coverage.
+- `tests/` — `test_equipment_logic.py` and `test_equipment_hud.py`.
+
+## Checking the look without a Jetson
+
+`equipment_hud.py` only needs cv2/numpy, so its output can be rendered to
+a plain image file and inspected without any camera or NanoOWL engine:
+
+```python
+import cv2, numpy as np
+from equipment_logic import reset_scan, scan_passed
+from equipment_hud import draw_checklist
+
+frame = np.zeros((480, 640, 3), dtype=np.uint8)
+scan = reset_scan()
+draw_checklist(frame, scan, ready=scan_passed(scan))
+cv2.imwrite("preview.png", frame)
+```
+
+Worth knowing if you touch the palette: `equipment_hud.PANEL_BG`/
+`PANEL_BORDER` are deliberately **not** the same literal BGR tuples as
+`handwash-next/nanoowl_monitor.py`'s. Rendering that file's tuples showed
+they read as a murky olive-brown on screen, not the "dark teal-navy" its
+own comment claims - an apparent red/blue channel swap that nothing could
+catch there, since that module needs a Jetson/camera/NanoOWL engine just
+to import. This module doesn't, so the same mistake is both visible and
+avoidable here.
 
 This is a prototype, not a certified clinical compliance device.

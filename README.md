@@ -44,4 +44,23 @@ A Jetson with `jetson-containers` and the `dustynv/nanoowl:r36.3.0` image for
 live camera modes (see `handwash-next/install-camera-deps.sh`); everything
 else (the simulator, the test suite) runs with plain Python 3.
 
+## Deploying to the Jetson
+
+There's no direct network path from a dev/CI environment to the device, so
+getting a change onto it is a step a person runs, not something done for
+you from here. From a machine that *can* reach the Jetson over SSH:
+
+```bash
+./deploy-to-jetson.sh user@jetson-host   # defaults to /home/nvidia/handwash-monitor
+```
+
+This `rsync`s the repo over, skipping on-device calibration/state
+(`config.json`, `logs/`, `.cache/`, `.deps/` - see the script for the exact
+list) so a redeploy never clobbers a tuned setup. Then, on the Jetson:
+
+```bash
+./argus-launcher/argus_launcher.sh     # desktop dashboard
+./argus-launcher/run_equipment.sh      # or the equipment scan directly
+```
+
 This is a prototype, not a certified clinical compliance device.
