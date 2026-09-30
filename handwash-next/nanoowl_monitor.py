@@ -336,12 +336,12 @@ def _status_dot(frame, center, complete):
     for HANDS READY / SOAP SEEN, instead of bracket text."""
 
     if complete:
-        cv2.circle(frame, center, 7, MINT, -1, cv2.LINE_AA)
+        cv2.circle(frame, center, 4, MINT, -1, cv2.LINE_AA)
         cx, cy = center
-        cv2.line(frame, (cx - 4, cy), (cx - 1, cy + 3), PANEL_BG, 2, cv2.LINE_AA)
-        cv2.line(frame, (cx - 1, cy + 3), (cx + 4, cy - 3), PANEL_BG, 2, cv2.LINE_AA)
+        cv2.line(frame, (cx - 2, cy), (cx - 1, cy + 1), PANEL_BG, 1, cv2.LINE_AA)
+        cv2.line(frame, (cx - 1, cy + 1), (cx + 2, cy - 2), PANEL_BG, 1, cv2.LINE_AA)
     else:
-        cv2.circle(frame, center, 7, DIM, 2, cv2.LINE_AA)
+        cv2.circle(frame, center, 4, DIM, 1, cv2.LINE_AA)
 
 
 def _progress_bar(frame, top_left, size, fraction, fill_color):
@@ -357,290 +357,85 @@ def _progress_bar(frame, top_left, size, fraction, fill_color):
 
 
 def draw_checklist(frame, monitor, separation_elapsed, current_time):
+    """Compact 224 x 184 card: about half the previous 310 x 260 area."""
+    x, y = 12, 12
+    width, height = min(224, frame.shape[1] - 24), 184
+    font = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Compact top-left card, styled to match the rest of the Argus product.
-    # Sized to fit its own content rather than a fixed oversized footprint,
-    # rounded and drop-shadowed so it reads as a floating card instead of
-    # a debug rectangle pasted over the feed.
+    def label(text, left, baseline, color=TEXT_MUTED, scale=0.31):
+        # Fit long prompts and calibrated timing values inside the card.
+        available = x + width - 9 - left
+        text_width = cv2.getTextSize(text, font, scale, 1)[0][0]
+        if text_width > available:
+            scale *= available / text_width
+        cv2.putText(frame, text, (left, baseline), font, scale, color, 1, cv2.LINE_AA)
 
-    x = 12
-    y = 12
+    panel_with_shadow(frame, (x, y), (x + width, y + height), 10, PANEL_BG, PANEL_BORDER)
+    rounded_rect(frame, (x, y + 8), (x + 2, y + height - 8), 1, MINT, -1)
 
-    width = min(310, frame.shape[1] - 24)
-    height = 260
-
-    panel_with_shadow(frame, (x, y), (x + width, y + height), 14, PANEL_BG, PANEL_BORDER)
-    rounded_rect(frame, (x, y + 10), (x + 3, y + height - 10), 1, MINT, -1)  # brand accent edge
-
-    # -----------------------------------------------------
-    # HEADER: logo mark + wordmark, live pulse, mode badge
-    # -----------------------------------------------------
-
-    cv2.circle(frame, (x + 20, y + 26), 6, MINT, -1, cv2.LINE_AA)
-    cv2.circle(frame, (x + 27, y + 21), 3, CYAN, -1, cv2.LINE_AA)
-    cv2.putText(
-        frame,
-        "ARGUS",
-        (x + 38, y + 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
-        TEXT_BRIGHT,
-        1,
-        cv2.LINE_AA,
-    )
-
-    badge_text = "ROOM PRACTICE" if ROOM_MODE else "REAL SINK TEST"
-    (badge_w, badge_h), _ = cv2.getTextSize(
-        badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1
-    )
-    badge_right = x + width - 12
-    badge_left = badge_right - badge_w - 14
-    rounded_rect(
-        frame, (badge_left, y + 13), (badge_right, y + 13 + badge_h + 8), 4, CYAN, -1
-    )
-    cv2.putText(
-        frame,
-        badge_text,
-        (badge_left + 7, y + 13 + badge_h + 2),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.3,
-        PANEL_BG,
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Small breathing dot ahead of the badge: a live model is running this
-    # instant, not a frozen mock-up - reassuring in exactly the moment a
-    # demo audience is deciding whether to believe that.
-    pulsing_dot(frame, (badge_left - 12, y + 13 + badge_h // 2 + 4), MINT, current_time)
-
+    pulsing_dot(frame, (x + 12, y + 14), MINT, current_time, min_radius=2, max_radius=3)
+    label("ARGUS", x + 22, y + 18, TEXT_BRIGHT, 0.36)
+    badge = "ROOM PRACTICE" if ROOM_MODE else "REAL SINK"
+    badge_width = cv2.getTextSize(badge, font, 0.27, 1)[0][0]
+    badge_left = x + width - badge_width - 17
+    rounded_rect(frame, (badge_left, y + 7), (x + width - 8, y + 23), 3, CYAN, -1)
+    label(badge, badge_left + 4, y + 18, PANEL_BG, 0.27)
     subtitle = (
-        "Practice only - foam and water bypassed, not WHO-verified"
+        "Practice only - soap/water bypassed"
         if ROOM_MODE
-        else f"WHO-guided handwash - {MINIMUM_WASH_TIME:.0f} to {MAXIMUM_WASH_TIME:.0f} seconds"
+        else f"WHO-guided | {MINIMUM_WASH_TIME:.0f}-{MAXIMUM_WASH_TIME:.0f}s"
     )
-    cv2.putText(
-        frame,
-        subtitle,
-        (x + 14, y + 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.28,
-        TEXT_FAINT,
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.line(
-        frame, (x + 14, y + 58), (x + width - 14, y + 58), PANEL_BORDER, 1, cv2.LINE_AA
-    )
+    label(subtitle, x + 9, y + 33, TEXT_FAINT, 0.27)
 
-    # -----------------------------------------------------
-    # CHECKLIST ITEMS
-    # -----------------------------------------------------
-
+    # Keep fallback keys beside their step without repeating instructions.
     checklist = [
-        (monitor["armed"], "Two hands detected"),
-        (
-            monitor["wet_confirmed"],
-            "Wet hands (press W)"
-            if ROOM_MODE
-            else "Wet hands (auto: water 3s - press W if missed)",
-        ),
-        (
-            ROOM_MODE or monitor["soap_seen"],
-            "Product bypassed - practice only" if ROOM_MODE else "Foam observed",
-        ),
-        (
-            monitor["rubbing_time"] >= REQUIRED_RUB_TIME,
-            f"{REQUIRED_RUB_TIME:.0f} sec active rubbing",
-        ),
-        (
-            monitor["rinse_confirmed"],
-            "Rinsed (press N)"
-            if ROOM_MODE
-            else "Rinsed (auto: tap off - press N if missed)",
-        ),
-        (
-            monitor["dry_confirmed"],
-            "Single-use towel (press D)"
-            if ROOM_MODE
-            else "Single-use towel (auto - press D if missed)",
-        ),
-        (
-            monitor["faucet_confirmed"],
-            (
-                "Tap closed with towel (press F)"
-                if ROOM_MODE
-                else "Tap closed with towel (auto - press F if missed)"
-            ),
-        ),
+        (monitor["armed"], "Two hands detected", ""),
+        (monitor["wet_confirmed"], "Wet hands", "W"),
+        (ROOM_MODE or monitor["soap_seen"],
+         "Soap bypassed (practice)" if ROOM_MODE else "Foam observed", ""),
+        (monitor["rubbing_time"] >= REQUIRED_RUB_TIME,
+         f"{REQUIRED_RUB_TIME:.0f}s active rubbing", ""),
+        (monitor["rinse_confirmed"], "Rinsed", "N"),
+        (monitor["dry_confirmed"], "Single-use towel", "D"),
+        (monitor["faucet_confirmed"], "Tap closed with towel", "F"),
     ]
+    for index, (complete, text, key) in enumerate(checklist):
+        baseline = y + 47 + index * 13
+        _status_dot(frame, (x + 13, baseline - 3), complete)
+        label(text, x + 24, baseline, TEXT_BRIGHT if complete else TEXT_MUTED)
+        if key:
+            label(key, x + width - 17, baseline, TEXT_FAINT, 0.27)
 
-    start_y = y + 70
+    label(f"Rub {monitor['rubbing_time']:.1f}/{REQUIRED_RUB_TIME:.0f}s",
+          x + 9, y + 140, scale=0.29)
+    total = f"Total {procedure_elapsed(monitor, current_time):.1f}/{MINIMUM_WASH_TIME:.0f}s"
+    total_width = cv2.getTextSize(total, font, 0.29, 1)[0][0]
+    label(total, x + width - 9 - total_width, y + 140, scale=0.29)
+    _progress_bar(frame, (x + 9, y + 146), (width - 18, 4),
+                  monitor["rubbing_time"] / REQUIRED_RUB_TIME, MINT)
 
-    for index, (complete, text) in enumerate(checklist):
-
-        line_y = start_y + index * 16
-
-        _status_dot(frame, (x + 20, line_y - 4), complete)
-
-        cv2.putText(
-            frame,
-            text,
-            (x + 36, line_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.34,
-            TEXT_BRIGHT if complete else TEXT_MUTED,
-            1,
-            cv2.LINE_AA,
-        )
-
-    # -----------------------------------------------------
-    # RUBBING PROGRESS
-    # -----------------------------------------------------
-
-    progress_y = start_y + len(checklist) * 16 + 8
-
-    rubbing_text = (
-        f"Active rub {monitor['rubbing_time']:.1f}/{REQUIRED_RUB_TIME:.0f}s"
-    )
-    total_text = (
-        f"Total {procedure_elapsed(monitor, current_time):.1f}/{MINIMUM_WASH_TIME:.0f}s"
-    )
-    cv2.putText(
-        frame,
-        rubbing_text,
-        (x + 14, progress_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        TEXT_MUTED,
-        1,
-        cv2.LINE_AA,
-    )
-    (total_w, _), _ = cv2.getTextSize(total_text, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
-    cv2.putText(
-        frame,
-        total_text,
-        (x + width - 14 - total_w, progress_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.32,
-        TEXT_MUTED,
-        1,
-        cv2.LINE_AA,
-    )
-
-    _progress_bar(
-        frame,
-        (x + 14, progress_y + 7),
-        (width - 28, 7),
-        monitor["rubbing_time"] / REQUIRED_RUB_TIME,
-        MINT,
-    )
-
-    # -----------------------------------------------------
-    # COACHING / NEXT STEP / SEPARATION WARNING
-    # -----------------------------------------------------
-
-    guide_y = progress_y + 24
-
-    if monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
-        seconds_left = REQUIRED_RUB_TIME - monitor["rubbing_time"]
-        guide_text = f"Rub hands with foam - {seconds_left:.0f}s left"
-        cv2.putText(
-            frame,
-            guide_text,
-            (x + 14, guide_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.32,
-            CYAN,
-            1,
-            cv2.LINE_AA,
-        )
+    # One contextual line avoids overlapping coaching and separation text.
+    hint = stall_hint(monitor, current_time)
+    if monitor["separated_since"] is not None and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
+        guidance = f"Hands apart {separation_elapsed:.1f}/{MAX_SEPARATION_TIME:.0f}s"
+        color = CORAL
+    elif monitor["state"] == "CONTACT_NO_MOTION":
+        guidance, color = "Keep moving your hands", CORAL
+    elif hint is not None:
+        step, key = hint
+        guidance, color = f"{step}: press {key} if missed", AMBER
+    elif monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
+        guidance = f"Keep rubbing - {REQUIRED_RUB_TIME - monitor['rubbing_time']:.0f}s left"
+        color = CYAN
     elif monitor["rubbing_time"] >= REQUIRED_RUB_TIME:
         remaining = missing_checkpoints(monitor, ROOM_MODE)
-        next_step = remaining[0] if remaining else "finish the 40 second procedure"
-        cv2.putText(
-            frame,
-            "NEXT: " + next_step,
-            (x + 14, guide_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.32,
-            CYAN,
-            1,
-            cv2.LINE_AA,
-        )
-
-    if (
-        monitor["separated_since"] is not None
-        and monitor["rubbing_time"] < REQUIRED_RUB_TIME
-    ):
-        separation_text = f"Apart {separation_elapsed:.1f}/{MAX_SEPARATION_TIME:.0f}s"
-        (sep_w, _), _ = cv2.getTextSize(
-            separation_text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1
-        )
-        cv2.putText(
-            frame,
-            separation_text,
-            (x + width - 14 - sep_w, guide_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.3,
-            CORAL,
-            1,
-            cv2.LINE_AA,
-        )
-
-    # -----------------------------------------------------
-    # STALL / STUCK HINT
-    # -----------------------------------------------------
-    # Tells the operator when to reach for the manual fallback instead of
-    # leaving them guessing why the checklist stopped advancing.
-
-    hint_y = guide_y + 16
-
-    if monitor["state"] == "CONTACT_NO_MOTION":
-        cv2.putText(
-            frame,
-            "Keep moving - contact detected, not enough motion yet",
-            (x + 14, hint_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.3,
-            CORAL,
-            1,
-            cv2.LINE_AA,
-        )
+        guidance = "Next: " + (remaining[0] if remaining else f"finish {MINIMUM_WASH_TIME:.0f}s procedure")
+        color = CYAN
     else:
-        hint = stall_hint(monitor, current_time)
-        if hint is not None:
-            step_name, key = hint
-            cv2.putText(
-                frame,
-                f"Still waiting on {step_name} - press {key} if it was missed",
-                (x + 14, hint_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.26,
-                AMBER,
-                1,
-                cv2.LINE_AA,
-            )
-
-    # -----------------------------------------------------
-    # CONTROLS
-    # -----------------------------------------------------
-
-    controls = (
-        "W wet   N rinse   D dry   F faucet+towel   R reset   C calibrate   Q quit"
-        if ROOM_MODE
-        else "W/N/D/F = fallback only, auto normally   R reset   C calibrate   Q quit"
-    )
-    cv2.putText(
-        frame,
-        controls,
-        (x + 14, y + height - 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.22,
-        TEXT_FAINT,
-        1,
-        cv2.LINE_AA,
-    )
+        guidance = "W/N/D/F: manual steps" if ROOM_MODE else "Auto steps | W/N/D/F if missed"
+        color = TEXT_FAINT
+    label(guidance, x + 9, y + 163, color, 0.28)
+    label("R reset   C calibrate   Q quit", x + 9, y + 177, TEXT_FAINT, 0.27)
 
 
 # =========================================================
