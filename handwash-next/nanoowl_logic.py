@@ -27,9 +27,9 @@ import numpy as np
 # WHO soap-and-water handwashing takes 40-60 seconds for the entire procedure.
 # NanoOWL measures active rubbing separately; the remaining time covers wetting,
 # rinsing, drying, and closing the tap with the towel.
-REQUIRED_RUB_TIME = 30.0
+REQUIRED_RUB_TIME = 40.0
 MINIMUM_WASH_TIME = 40.0
-MAXIMUM_WASH_TIME = 60.0
+MAXIMUM_WASH_TIME = 70.0
 
 # Hands must initially remain together/rubbing for five continuous seconds.
 INITIAL_CONFIRMATION_TIME = 5.0
@@ -127,6 +127,16 @@ GRIP_VARIATION_TOLERANCE = 0.12
 # footage - tune it on-device (see load_config at the bottom of this file)
 # rather than editing these in place.
 CAMERA_ID = 0
+# Kept at 640x480, not bumped for extra on-screen sharpness - every pixel
+# here is paid for every frame (full-frame cvtColor, the PIL conversion
+# feeding NanoOWL, motion diffing) competing with TensorRT inference for
+# the same Jetson budget, so it's not a resolution to raise speculatively
+# without measuring headroom on the actual device. The on-screen
+# blockiness this used to cause when the window was resized larger is
+# fixed at render time instead - see fit_frame_to_window in
+# nanoowl_monitor.py, which upscales with real interpolation regardless
+# of capture resolution. Raise this via config.json if a specific device
+# has inference cycles to spare and wants more native detail.
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 
@@ -324,13 +334,13 @@ def missing_checkpoints(monitor, room_mode=False):
     """
     checks = [
         ("wet hands", monitor["wet_confirmed"]),
-        ("30s active rubbing", monitor["rubbing_time"] >= REQUIRED_RUB_TIME),
+        (f"{REQUIRED_RUB_TIME:.0f}s active rubbing", monitor["rubbing_time"] >= REQUIRED_RUB_TIME),
         ("rinse", monitor["rinse_confirmed"]),
         ("single-use towel", monitor["dry_confirmed"]),
         ("tap closed with towel", monitor["faucet_confirmed"]),
     ]
     if not room_mode:
-        checks.insert(1, ("soap", monitor["soap_seen"]))
+        checks.insert(1, ("foam", monitor["soap_seen"]))
     return [name for name, complete in checks if not complete]
 
 

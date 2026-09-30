@@ -1,4 +1,5 @@
 import cv2
+import math
 import sys
 import time
 import numpy as np
@@ -45,7 +46,6 @@ from nanoowl_logic import (
     motion_ratio,
     detection_name,
     strongest_by_side,
-    technique_prompt,
     procedure_elapsed,
     missing_checkpoints,
     reset_monitor,
@@ -54,8 +54,6 @@ from nanoowl_logic import (
     advance_dry_evidence,
     advance_faucet_evidence,
     advance_soap_evidence,
-    advance_technique_variation,
-    technique_variation_due,
     advance_stall_tracking,
     stall_hint,
 )
@@ -80,7 +78,7 @@ PROMPT = (
     "[a left hand, a right hand, " "a left forearm, a right forearm]"
     if ROOM_MODE
     else "[a left hand, a right hand, "
-    "a left forearm, a right forearm, soap foam, "
+    "a left forearm, a right forearm, foam, "
     "running water, a towel, a faucet]"
 )
 
@@ -117,18 +115,130 @@ def cv2_to_pil(frame):
 
 
 # =========================================================
+# ROUNDED-RECT PRIMITIVE
+# =========================================================
+# Every panel/chip in this file used to be a hard-cornered cv2.rectangle,
+# which reads as a placeholder/wireframe rather than a finished product.
+# One shared helper (filled or outline, via `thickness`) keeps every card
+# in the HUD consistent instead of each caller approximating its own.
+
+
+def rounded_rect(frame, top_left, bottom_right, radius, color, thickness=-1):
+
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+
+    if thickness < 0:
+        cv2.rectangle(frame, (x1 + radius, y1), (x2 - radius, y2), color, -1, cv2.LINE_AA)
+        cv2.rectangle(frame, (x1, y1 + radius), (x2, y2 - radius), color, -1, cv2.LINE_AA)
+        for cx, cy in (
+            (x1 + radius, y1 + radius),
+            (x2 - radius, y1 + radius),
+            (x1 + radius, y2 - radius),
+            (x2 - radius, y2 - radius),
+        ):
+            cv2.circle(frame, (cx, cy), radius, color, -1, cv2.LINE_AA)
+    else:
+        for (cx, cy), start_angle in (
+            ((x1 + radius, y1 + radius), 180),
+            ((x2 - radius, y1 + radius), 270),
+            ((x2 - radius, y2 - radius), 0),
+            ((x1 + radius, y2 - radius), 90),
+        ):
+            cv2.ellipse(
+                frame, (cx, cy), (radius, radius), 0, start_angle, start_angle + 90,
+                color, thickness, cv2.LINE_AA,
+            )
+        cv2.line(frame, (x1 + radius, y1), (x2 - radius, y1), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x1 + radius, y2), (x2 - radius, y2), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x1, y1 + radius), (x1, y2 - radius), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (x2, y1 + radius), (x2, y2 - radius), color, thickness, cv2.LINE_AA)
+
+
+def panel_with_shadow(frame, top_left, bottom_right, radius, fill_color, border_color, opacity=0.96):
+    """Blends a soft dark shadow + a rounded, near-opaque card into `frame`
+    in place - the shared look behind the checklist card and the
+    calibration strip, instead of each caller hand-rolling its own
+    addWeighted blend and flat-cornered rectangle."""
+
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    pad = radius + 6
+
+    shadow_region = (
+        max(0, y1 - pad), min(frame.shape[0], y2 + pad + 6),
+        max(0, x1 - pad), min(frame.shape[1], x2 + pad + 6),
+    )
+    sy1, sy2, sx1, sx2 = shadow_region
+    shadow_layer = frame[sy1:sy2, sx1:sx2].copy()
+    rounded_rect(
+        shadow_layer, (x1 - sx1 + 3, y1 - sy1 + 5), (x2 - sx1 + 3, y2 - sy1 + 5),
+        radius, (0, 0, 0), -1,
+    )
+    frame[sy1:sy2, sx1:sx2] = cv2.addWeighted(
+        shadow_layer, 0.35, frame[sy1:sy2, sx1:sx2], 0.65, 0
+    )
+
+    card_layer = frame[y1:y2, x1:x2].copy()
+    rounded_rect(card_layer, (0, 0), (x2 - x1, y2 - y1), radius, fill_color, -1)
+    frame[y1:y2, x1:x2] = cv2.addWeighted(
+        card_layer, opacity, frame[y1:y2, x1:x2], 1 - opacity, 0
+    )
+    rounded_rect(frame, (x1, y1), (x2, y2), radius, border_color, 1)
+
+
+def pulsing_dot(frame, center, base_color, current_time, period=1.6, min_radius=3, max_radius=5):
+    """A soft breathing dot - the little visual tell that this is a live
+    model running right now, not a static screenshot. Cheap sine pulse on
+    radius; alpha-blended so the glow can bleed past the dot itself."""
+
+    phase = (math.sin(current_time * (2 * math.pi / period)) + 1) / 2
+    radius = int(min_radius + (max_radius - min_radius) * phase)
+
+    x, y = center
+    reach = max_radius + 4
+    gx1, gy1 = max(0, x - reach), max(0, y - reach)
+    gx2, gy2 = x + reach, y + reach
+    glow_region = frame[gy1:gy2, gx1:gx2]
+    if glow_region.size:
+        glow_layer = glow_region.copy()
+        cv2.circle(glow_layer, (x - gx1, y - gy1), reach, base_color, -1, cv2.LINE_AA)
+        frame[gy1:gy2, gx1:gx2] = cv2.addWeighted(
+            glow_layer, 0.12 + 0.1 * phase, glow_region, 0.88 - 0.1 * phase, 0
+        )
+
+    cv2.circle(frame, center, radius, base_color, -1, cv2.LINE_AA)
+
+
+# =========================================================
 # DRAW DETECTION BOX
 # =========================================================
 
 
 def draw_box(frame, box, label, color):
+    """An anti-aliased box plus a filled label chip (rather than bare
+    stroked text) so the tag stays legible over any background - a busy
+    sink, a bright window, skin tone - the way modern CV demo overlays
+    (chips with a solid backing) read instead of a debug-print box."""
 
     x1, y1, x2, y2 = [int(value) for value in box]
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
+    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.46, 1)
+    chip_y2 = max(text_h + 14, y1 - 4)
+    chip_y1 = chip_y2 - text_h - 12
+    # Clamped so a box near the right edge doesn't push its label chip
+    # off-frame - the box itself may still run off-screen, but the tag
+    # naming it should always stay readable.
+    chip_x1 = max(0, min(x1, frame.shape[1] - text_w - 16))
+    chip_x2 = chip_x1 + text_w + 16
+
+    rounded_rect(frame, (chip_x1, chip_y1), (chip_x2, chip_y2), 5, color, -1)
     cv2.putText(
-        frame, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2
+        frame, label, (chip_x1 + 8, chip_y2 - 7), cv2.FONT_HERSHEY_SIMPLEX,
+        0.46, PANEL_BG, 1, cv2.LINE_AA,
     )
 
 
@@ -137,37 +247,78 @@ def draw_box(frame, box, label, color):
 # =========================================================
 
 
-def result_screen(frame, correct, reason="", title=None):
+_RESULT_ICON_RADIUS = 46
+
+
+def _draw_check_icon(frame, center, color, scale=1.0):
+    cx, cy = center
+    radius = int(_RESULT_ICON_RADIUS * scale)
+    cv2.circle(frame, center, radius, color, 4, cv2.LINE_AA)
+    p1 = (cx - int(radius * 0.45), cy + int(radius * 0.05))
+    p2 = (cx - int(radius * 0.12), cy + int(radius * 0.38))
+    p3 = (cx + int(radius * 0.48), cy - int(radius * 0.35))
+    cv2.line(frame, p1, p2, color, 6, cv2.LINE_AA)
+    cv2.line(frame, p2, p3, color, 6, cv2.LINE_AA)
+
+
+def _draw_cross_icon(frame, center, color, scale=1.0):
+    cx, cy = center
+    radius = int(_RESULT_ICON_RADIUS * scale)
+    arm = int(32 * scale)
+    cv2.circle(frame, center, radius, color, 4, cv2.LINE_AA)
+    cv2.line(frame, (cx - arm, cy - arm), (cx + arm, cy + arm), color, 6, cv2.LINE_AA)
+    cv2.line(frame, (cx - arm, cy + arm), (cx + arm, cy - arm), color, 6, cv2.LINE_AA)
+
+
+def result_screen(frame, correct, reason="", title=None, elapsed=None):
+    """Full-frame result takeover. `elapsed` (seconds since the result
+    fired) drives a quick fade/scale-in on the icon and a wash-in on the
+    color overlay so the result lands as a distinct beat instead of
+    popping in fully-formed on the very first frame."""
+
+    fade = 1.0 if elapsed is None else min(1.0, elapsed / 0.35)
+    accent = MINT if correct else CORAL
 
     overlay = np.zeros_like(frame)
-    overlay[:] = MINT if correct else CORAL
+    overlay[:] = accent
 
-    output = cv2.addWeighted(frame, 0.25, overlay, 0.75, 0)
+    output = cv2.addWeighted(frame, 1 - 0.75 * fade, overlay, 0.75 * fade, 0)
 
     if title is None:
         title = "OBSERVED STEPS COMPLETE" if correct else "HANDWASH INCOMPLETE"
 
+    height, width = output.shape[:2]
+    icon_center = (width // 2, max(110, height // 2 - 120))
+    icon_scale = 0.5 + 0.5 * min(1.0, fade * 1.4)
+
+    if correct:
+        _draw_check_icon(output, icon_center, TEXT_BRIGHT, icon_scale)
+    else:
+        _draw_cross_icon(output, icon_center, TEXT_BRIGHT, icon_scale)
+
+    (title_w, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_DUPLEX, 1.05, 2)
     cv2.putText(
         output,
         title,
-        (30, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
+        (max(30, (width - title_w) // 2), icon_center[1] + 90),
+        cv2.FONT_HERSHEY_DUPLEX,
+        1.05,
         TEXT_BRIGHT,
-        3,
+        2,
         cv2.LINE_AA,
     )
 
     if reason:
 
+        (reason_w, _), _ = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
         cv2.putText(
             output,
             reason,
-            (30, 145),
+            (max(30, (width - reason_w) // 2), icon_center[1] + 130),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             TEXT_BRIGHT,
-            2,
+            1,
             cv2.LINE_AA,
         )
 
@@ -196,46 +347,43 @@ def _status_dot(frame, center, complete):
 def _progress_bar(frame, top_left, size, fraction, fill_color):
     x, y = top_left
     width, bar_height = size
-    cv2.rectangle(frame, (x, y), (x + width, y + bar_height), PANEL_BORDER, -1)
+    radius = bar_height // 2
+    rounded_rect(frame, (x, y), (x + width, y + bar_height), radius, PANEL_BORDER, -1)
     fill_width = int(width * max(0.0, min(1.0, fraction)))
-    if fill_width:
-        cv2.rectangle(frame, (x, y), (x + fill_width, y + bar_height), fill_color, -1)
+    if fill_width >= bar_height:
+        rounded_rect(frame, (x, y), (x + fill_width, y + bar_height), radius, fill_color, -1)
+    elif fill_width:
+        cv2.circle(frame, (x + radius, y + radius), radius, fill_color, -1, cv2.LINE_AA)
 
 
 def draw_checklist(frame, monitor, separation_elapsed, current_time):
 
     # Compact top-left card, styled to match the rest of the Argus product.
+    # Sized to fit its own content rather than a fixed oversized footprint,
+    # rounded and drop-shadowed so it reads as a floating card instead of
+    # a debug rectangle pasted over the feed.
 
     x = 12
     y = 12
 
-    width = min(500, frame.shape[1] - 24)
-    height = 368
+    width = min(310, frame.shape[1] - 24)
+    height = 260
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x + width, y + height), PANEL_BG, -1)
-    frame[y : y + height, x : x + width] = cv2.addWeighted(
-        overlay[y : y + height, x : x + width],
-        0.88,
-        frame[y : y + height, x : x + width],
-        0.12,
-        0,
-    )
-    cv2.rectangle(frame, (x, y), (x + width, y + height), PANEL_BORDER, 1, cv2.LINE_AA)
-    cv2.rectangle(frame, (x, y), (x + 4, y + height), MINT, -1)  # brand accent edge
+    panel_with_shadow(frame, (x, y), (x + width, y + height), 14, PANEL_BG, PANEL_BORDER)
+    rounded_rect(frame, (x, y + 10), (x + 3, y + height - 10), 1, MINT, -1)  # brand accent edge
 
     # -----------------------------------------------------
-    # HEADER: logo mark + wordmark, mode badge
+    # HEADER: logo mark + wordmark, live pulse, mode badge
     # -----------------------------------------------------
 
-    cv2.circle(frame, (x + 24, y + 30), 7, MINT, -1, cv2.LINE_AA)
-    cv2.circle(frame, (x + 33, y + 24), 4, CYAN, -1, cv2.LINE_AA)
+    cv2.circle(frame, (x + 20, y + 26), 6, MINT, -1, cv2.LINE_AA)
+    cv2.circle(frame, (x + 27, y + 21), 3, CYAN, -1, cv2.LINE_AA)
     cv2.putText(
         frame,
         "ARGUS",
-        (x + 45, y + 36),
+        (x + 38, y + 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
+        0.42,
         TEXT_BRIGHT,
         1,
         cv2.LINE_AA,
@@ -243,41 +391,46 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
 
     badge_text = "ROOM PRACTICE" if ROOM_MODE else "REAL SINK TEST"
     (badge_w, badge_h), _ = cv2.getTextSize(
-        badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1
+        badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1
     )
     badge_right = x + width - 12
-    badge_left = badge_right - badge_w - 16
-    cv2.rectangle(
-        frame, (badge_left, y + 16), (badge_right, y + 16 + badge_h + 10), CYAN, -1
+    badge_left = badge_right - badge_w - 14
+    rounded_rect(
+        frame, (badge_left, y + 13), (badge_right, y + 13 + badge_h + 8), 4, CYAN, -1
     )
     cv2.putText(
         frame,
         badge_text,
-        (badge_left + 8, y + 16 + badge_h + 3),
+        (badge_left + 7, y + 13 + badge_h + 2),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.36,
+        0.3,
         PANEL_BG,
         1,
         cv2.LINE_AA,
     )
 
+    # Small breathing dot ahead of the badge: a live model is running this
+    # instant, not a frozen mock-up - reassuring in exactly the moment a
+    # demo audience is deciding whether to believe that.
+    pulsing_dot(frame, (badge_left - 12, y + 13 + badge_h // 2 + 4), MINT, current_time)
+
     subtitle = (
-        "Practice only - soap and water bypassed, not WHO-verified"
+        "Practice only - foam and water bypassed, not WHO-verified"
         if ROOM_MODE
-        else "WHO-guided handwash - 40 to 60 seconds"
+        else f"WHO-guided handwash - {MINIMUM_WASH_TIME:.0f} to {MAXIMUM_WASH_TIME:.0f} seconds"
     )
     cv2.putText(
         frame,
         subtitle,
-        (x + 14, y + 58),
+        (x + 14, y + 50),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.38,
+        0.28,
         TEXT_FAINT,
         1,
         cv2.LINE_AA,
     )
     cv2.line(
-        frame, (x + 14, y + 68), (x + width - 14, y + 68), PANEL_BORDER, 1, cv2.LINE_AA
+        frame, (x + 14, y + 58), (x + width - 14, y + 58), PANEL_BORDER, 1, cv2.LINE_AA
     )
 
     # -----------------------------------------------------
@@ -294,9 +447,12 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         ),
         (
             ROOM_MODE or monitor["soap_seen"],
-            "Product bypassed - practice only" if ROOM_MODE else "Soap / foam observed",
+            "Product bypassed - practice only" if ROOM_MODE else "Foam observed",
         ),
-        (monitor["rubbing_time"] >= REQUIRED_RUB_TIME, "30 sec active rubbing"),
+        (
+            monitor["rubbing_time"] >= REQUIRED_RUB_TIME,
+            f"{REQUIRED_RUB_TIME:.0f} sec active rubbing",
+        ),
         (
             monitor["rinse_confirmed"],
             "Rinsed (press N)"
@@ -319,20 +475,20 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         ),
     ]
 
-    start_y = y + 90
+    start_y = y + 70
 
     for index, (complete, text) in enumerate(checklist):
 
-        line_y = start_y + index * 23
+        line_y = start_y + index * 16
 
-        _status_dot(frame, (x + 22, line_y - 5), complete)
+        _status_dot(frame, (x + 20, line_y - 4), complete)
 
         cv2.putText(
             frame,
             text,
-            (x + 40, line_y),
+            (x + 36, line_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.34,
             TEXT_BRIGHT if complete else TEXT_MUTED,
             1,
             cv2.LINE_AA,
@@ -342,7 +498,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     # RUBBING PROGRESS
     # -----------------------------------------------------
 
-    progress_y = start_y + len(checklist) * 23 + 12
+    progress_y = start_y + len(checklist) * 16 + 8
 
     rubbing_text = (
         f"Active rub {monitor['rubbing_time']:.1f}/{REQUIRED_RUB_TIME:.0f}s"
@@ -355,18 +511,18 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         rubbing_text,
         (x + 14, progress_y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
+        0.32,
         TEXT_MUTED,
         1,
         cv2.LINE_AA,
     )
-    (total_w, _), _ = cv2.getTextSize(total_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    (total_w, _), _ = cv2.getTextSize(total_text, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
     cv2.putText(
         frame,
         total_text,
         (x + width - 14 - total_w, progress_y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
+        0.32,
         TEXT_MUTED,
         1,
         cv2.LINE_AA,
@@ -374,8 +530,8 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
 
     _progress_bar(
         frame,
-        (x + 14, progress_y + 8),
-        (width - 28, 8),
+        (x + 14, progress_y + 7),
+        (width - 28, 7),
         monitor["rubbing_time"] / REQUIRED_RUB_TIME,
         MINT,
     )
@@ -384,20 +540,19 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     # COACHING / NEXT STEP / SEPARATION WARNING
     # -----------------------------------------------------
 
-    guide_y = progress_y + 38
+    guide_y = progress_y + 24
 
     if monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
-        guide_text = "GUIDE: " + technique_prompt(monitor["rubbing_time"])
-        if technique_variation_due(monitor, monitor["rubbing_time"]):
-            guide_text += "  - try a different grip"
+        seconds_left = REQUIRED_RUB_TIME - monitor["rubbing_time"]
+        guide_text = f"Rub hands with foam - {seconds_left:.0f}s left"
         cv2.putText(
             frame,
             guide_text,
             (x + 14, guide_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.32,
             CYAN,
-            2,
+            1,
             cv2.LINE_AA,
         )
     elif monitor["rubbing_time"] >= REQUIRED_RUB_TIME:
@@ -408,7 +563,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
             "NEXT: " + next_step,
             (x + 14, guide_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
+            0.32,
             CYAN,
             1,
             cv2.LINE_AA,
@@ -420,14 +575,14 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     ):
         separation_text = f"Apart {separation_elapsed:.1f}/{MAX_SEPARATION_TIME:.0f}s"
         (sep_w, _), _ = cv2.getTextSize(
-            separation_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1
+            separation_text, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1
         )
         cv2.putText(
             frame,
             separation_text,
             (x + width - 14 - sep_w, guide_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
+            0.3,
             CORAL,
             1,
             cv2.LINE_AA,
@@ -439,7 +594,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     # Tells the operator when to reach for the manual fallback instead of
     # leaving them guessing why the checklist stopped advancing.
 
-    hint_y = guide_y + 24
+    hint_y = guide_y + 16
 
     if monitor["state"] == "CONTACT_NO_MOTION":
         cv2.putText(
@@ -447,7 +602,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
             "Keep moving - contact detected, not enough motion yet",
             (x + 14, hint_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
+            0.3,
             CORAL,
             1,
             cv2.LINE_AA,
@@ -461,7 +616,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
                 f"Still waiting on {step_name} - press {key} if it was missed",
                 (x + 14, hint_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
+                0.26,
                 AMBER,
                 1,
                 cv2.LINE_AA,
@@ -479,9 +634,9 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
     cv2.putText(
         frame,
         controls,
-        (x + 14, y + height - 16),
+        (x + 14, y + height - 14),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.33,
+        0.22,
         TEXT_FAINT,
         1,
         cv2.LINE_AA,
@@ -515,16 +670,7 @@ def draw_calibration(
     right = min(width - 14, 900)
     top = height - 76
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (14, top), (right, height - 14), PANEL_BG, -1)
-    frame[top : height - 14, 14:right] = cv2.addWeighted(
-        overlay[top : height - 14, 14:right],
-        0.88,
-        frame[top : height - 14, 14:right],
-        0.12,
-        0,
-    )
-    cv2.rectangle(frame, (14, top), (right, height - 14), PANEL_BORDER, 1, cv2.LINE_AA)
+    panel_with_shadow(frame, (14, top), (right, height - 14), 10, PANEL_BG, PANEL_BORDER, opacity=0.88)
 
     cv2.putText(
         frame,
@@ -538,7 +684,7 @@ def draw_calibration(
     )
 
     line1 = (
-        f"soap {soap_score:.2f}/{SOAP_EVIDENCE_THRESHOLD:.2f}   "
+        f"foam {soap_score:.2f}/{SOAP_EVIDENCE_THRESHOLD:.2f}   "
         f"water {water_score:.2f}/{WATER_EVIDENCE_THRESHOLD:.2f}   "
         f"towel {towel_score:.2f}/{TOWEL_EVIDENCE_THRESHOLD:.2f}   "
         f"motion {motion_ratio_value:.3f}/{MINIMUM_MOTION_RATIO:.3f}"
@@ -556,6 +702,36 @@ def draw_calibration(
     )
     cv2.putText(
         frame, line2, (24, top + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.38, TEXT_MUTED, 1, cv2.LINE_AA
+    )
+
+
+def fit_frame_to_window(frame, window_name):
+    """cv2's own backend stretches the displayed frame to whatever size the
+    window has been resized to, but does it with a cheap nearest-neighbor
+    scale - fine at 1:1, visibly blocky once the window is bigger than the
+    frame (dragged larger, maximized, a kiosk display). Doing that resize
+    ourselves with real interpolation keeps the picture smooth at any
+    window size instead of relying on that fallback."""
+
+    try:
+        _, _, window_width, window_height = cv2.getWindowImageRect(window_name)
+    except cv2.error:
+        return frame
+
+    if window_width <= 0 or window_height <= 0:
+        return frame
+
+    frame_height, frame_width = frame.shape[:2]
+
+    if (window_width, window_height) == (frame_width, frame_height):
+        return frame
+
+    interpolation = (
+        cv2.INTER_AREA if window_width < frame_width else cv2.INTER_CUBIC
+    )
+
+    return cv2.resize(
+        frame, (window_width, window_height), interpolation=interpolation
     )
 
 
@@ -652,6 +828,13 @@ def main():
     # so the thresholds in config.json can be tuned against what the camera
     # is actually seeing, instead of guessed blind. Nothing here is saved.
     calibration = False
+
+    # WINDOW_NORMAL (rather than the default WINDOW_AUTOSIZE) gives a
+    # regular, resizable window with normal title-bar minimize/maximize
+    # controls, sized to the window manager's default instead of being
+    # forced fullscreen or to a fixed resolution.
+    WINDOW_NAME = "Argus - NanoOWL Hand Hygiene"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     # =========================================================
     # MAIN LOOP
@@ -870,18 +1053,14 @@ def main():
             )
 
             if advance_soap_evidence(monitor, soap_evidence, delta_time):
-                print("Soap / foam observed near the hands.")
+                print("Foam observed near the hands.")
 
             if soap_detection is not None:
 
                 draw_box(
                     frame,
                     soap_detection["box"],
-                    (
-                        "SOAP / FOAM?"
-                        if not monitor["soap_seen"]
-                        else "SOAP / FOAM OBSERVED"
-                    ),
+                    "FOAM?" if not monitor["soap_seen"] else "FOAM OBSERVED",
                     AMBER,
                 )
 
@@ -992,7 +1171,7 @@ def main():
 
                 x1, y1, x2, y2 = activity_roi
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (160, 160, 160), 1)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (160, 160, 160), 1, cv2.LINE_AA)
 
             # =====================================================
             # CONTACT DETECTION
@@ -1180,9 +1359,9 @@ def main():
                 monitor["result"] = "INCORRECT"
                 missing = missing_checkpoints(monitor, ROOM_MODE)
                 monitor["result_reason"] = (
-                    "60s elapsed; missing: " + ", ".join(missing[:2])
+                    f"{MAXIMUM_WASH_TIME:.0f}s elapsed; missing: " + ", ".join(missing[:2])
                     if missing
-                    else "Procedure exceeded the 40-60s window"
+                    else f"Procedure exceeded the {MINIMUM_WASH_TIME:.0f}-{MAXIMUM_WASH_TIME:.0f}s window"
                 )
                 monitor["result_started"] = current_time
                 print("INCOMPLETE:", monitor["result_reason"])
@@ -1215,7 +1394,10 @@ def main():
                     monitor["state"] = "COMPLETE"
                     monitor["result"] = "CORRECT"
                     monitor["result_started"] = current_time
-                    print("OBSERVED STEPS COMPLETE: WHO-guided 40-60 second workflow.")
+                    print(
+                        "OBSERVED STEPS COMPLETE: WHO-guided "
+                        f"{MINIMUM_WASH_TIME:.0f}-{MAXIMUM_WASH_TIME:.0f} second workflow."
+                    )
                 else:
                     monitor["state"] = "AWAITING_CHECKPOINTS"
 
@@ -1230,13 +1412,6 @@ def main():
             else:
 
                 separation_elapsed = 0.0
-
-            # =====================================================
-            # TECHNIQUE-VARIATION COACHING (non-blocking nudge)
-            # =====================================================
-
-            if monitor["rubbing_confirmed"] and monitor["rubbing_time"] < REQUIRED_RUB_TIME:
-                advance_technique_variation(monitor, monitor["rubbing_time"], hand_boxes)
 
             # =====================================================
             # STALL TRACKING (nudge toward the W/N/D/F fallback)
@@ -1270,14 +1445,22 @@ def main():
             # RESULT SCREEN
             # =====================================================
 
+            if monitor["result"] is not None:
+                result_elapsed = current_time - monitor["result_started"]
+
             if monitor["result"] == "INCORRECT":
 
-                frame = result_screen(frame, False, monitor["result_reason"])
+                frame = result_screen(
+                    frame, False, monitor["result_reason"], elapsed=result_elapsed
+                )
 
             elif monitor["result"] == "CORRECT":
 
                 frame = result_screen(
-                    frame, True, "Guided sequence + required checkpoints"
+                    frame,
+                    True,
+                    "Guided sequence + required checkpoints",
+                    elapsed=result_elapsed,
                 )
 
             elif monitor["result"] == "PRACTICE":
@@ -1286,13 +1469,14 @@ def main():
                     True,
                     "No product or hygiene outcome verified",
                     title="ROOM PRACTICE COMPLETE",
+                    elapsed=result_elapsed,
                 )
 
             # =====================================================
             # SHOW CAMERA
             # =====================================================
 
-            cv2.imshow("Argus - NanoOWL Hand Hygiene", frame)
+            cv2.imshow(WINDOW_NAME, fit_frame_to_window(frame, WINDOW_NAME))
 
             key = cv2.waitKey(1) & 0xFF
 

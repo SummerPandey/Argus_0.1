@@ -29,7 +29,8 @@ class LatestFrameCamera:
         self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.camera_id = selected
         self.frames, self.running, self.error = queue.Queue(maxsize=1), True, None
-        threading.Thread(target=self._capture, daemon=True).start()
+        self.thread = threading.Thread(target=self._capture, daemon=True)
+        self.thread.start()
 
     def _capture(self):
         while self.running:
@@ -51,7 +52,21 @@ class LatestFrameCamera:
 
     def close(self):
         self.running = False
-        self.capture.release()
+        # The capture thread only notices `running` went False on its next
+        # loop check, which happens after its current capture.read() call
+        # returns - so release() must wait for that, not fire immediately.
+        # Releasing the device while that thread is still inside read() on
+        # the same VideoCapture is a real race (undefined behavior in
+        # OpenCV, backend-dependent - can crash rather than just leak). If
+        # the thread is still stuck past the timeout (a truly wedged
+        # driver), skip release() rather than race it; a daemon thread and
+        # its file descriptor are reclaimed by the OS on process exit
+        # regardless.
+        self.thread.join(timeout=2)
+        if not self.thread.is_alive():
+            self.capture.release()
+        else:
+            print("LatestFrameCamera: capture thread did not stop in time, skipping release()")
 
 
 class AsyncHandVision:
@@ -109,7 +124,15 @@ class AsyncHandVision:
     def close(self):
         self.running = False
         self.thread.join(timeout=2)
-        self.vision.close()
+        # If the worker is still inside self.vision.process(...) past the
+        # timeout, closing the MediaPipe solution here would race a still-
+        # running inference call on that same object. Leave it be in that
+        # case - the daemon thread and MediaPipe's own resources are
+        # reclaimed by the OS on process exit regardless.
+        if not self.thread.is_alive():
+            self.vision.close()
+        else:
+            print("AsyncHandVision: worker thread did not stop in time, skipping vision.close()")
 
 
 def draw_landmarks(frame, result, cv2):
@@ -217,7 +240,17 @@ def main():
     fps, frames, fps_at, debug = 0.0, 0, time.monotonic(), False
     try:
         while camera.running:
-            frame, now = camera.latest(), time.monotonic()
+            # `camera.running` can still flip False (and the last frame
+            # get drained) between that check and this call - the capture
+            # thread reports a real failure by stopping without pushing a
+            # final frame, so latest() would otherwise block for a second
+            # and then raise queue.Empty uncaught, crashing the app
+            # instead of surfacing camera.error like this was meant to.
+            try:
+                frame = camera.latest()
+            except queue.Empty:
+                break
+            now = time.monotonic()
             vision.submit(frame, now)
             new_sequence, newest = vision.latest()
             if new_sequence != vision_sequence:
@@ -245,6 +278,8 @@ def main():
             if key == ord("d"):
                 debug = not debug
     finally:
+        if camera.error:
+            print(f"Argus: {camera.error}")
         vision.close()
         camera.close()
         cv2.destroyAllWindows()

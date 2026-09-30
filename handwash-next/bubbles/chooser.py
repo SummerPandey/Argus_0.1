@@ -50,12 +50,28 @@ class ArgusLauncher:
             row.pack_propagate(False)
             if selected:
                 tk.Frame(row, bg=TEAL, width=3).pack(side="left", fill="y")
-            tk.Label(row, text=label, bg=row["bg"],
-                     fg=WHITE if selected else "#91AAB0",
-                     font=("DejaVu Sans", 10, "bold" if selected else "normal")).pack(
-                         side="left", padx=16)
+            item = tk.Label(row, text=label, bg=row["bg"],
+                            fg=WHITE if selected else "#91AAB0",
+                            font=("DejaVu Sans", 10, "bold" if selected else "normal"))
+            item.pack(side="left", padx=16)
+            if not selected:
+                # Rows below "Overview" aren't wired to anything yet, but a
+                # hover state still tells the presenter's mouse "this is a
+                # real nav" instead of feeling like a static screenshot.
+                def _enter(_e, row=row, item=item):
+                    row.configure(bg=NAVY_2)
+                    item.configure(bg=NAVY_2, fg=WHITE)
 
-        footer = tk.Frame(bar, bg=NAVY_2, height=78)
+                def _leave(_e, row=row, item=item):
+                    row.configure(bg=NAVY)
+                    item.configure(bg=NAVY, fg="#91AAB0")
+
+                row.bind("<Enter>", _enter)
+                row.bind("<Leave>", _leave)
+                item.bind("<Enter>", _enter)
+                item.bind("<Leave>", _leave)
+
+        footer = tk.Frame(bar, bg=NAVY_2, height=90)
         footer.pack(side="bottom", fill="x", padx=18, pady=18)
         footer.pack_propagate(False)
         tk.Label(footer, text="●  SYSTEM READY", bg=NAVY_2, fg=TEAL,
@@ -63,6 +79,8 @@ class ArgusLauncher:
                                                         pady=(15, 4))
         tk.Label(footer, text="On-device processing  •  Beta", bg=NAVY_2,
                  fg="#7898A1", font=("DejaVu Sans", 7)).pack(anchor="w", padx=15)
+        tk.Label(footer, text="Press Esc to exit fullscreen", bg=NAVY_2,
+                 fg="#4E6A72", font=("DejaVu Sans", 7)).pack(anchor="w", padx=15, pady=(6, 0))
 
     def _content(self):
         shell = tk.Frame(self.root, bg=SURFACE)
@@ -113,7 +131,7 @@ class ArgusLauncher:
         )
         for index, (title, detail, mode, accent) in enumerate(choices):
             card = tk.Frame(modes, bg="#F7FAF9", highlightbackground=BORDER,
-                            highlightthickness=1, height=82)
+                            highlightthickness=1, height=82, cursor="hand2")
             card.grid(row=0, column=index, sticky="nsew", padx=5)
             card.grid_propagate(False)
             modes.grid_columnconfigure(index, weight=1, uniform="mode")
@@ -127,6 +145,28 @@ class ArgusLauncher:
                                relief="flat", bd=0, font=("DejaVu Sans", 7, "bold"),
                                cursor="hand2")
             button.place(relx=1, rely=1, x=-8, y=-6, anchor="se")
+
+            # Whole-card hover (border brightens to the mode's own accent),
+            # not just the button, so the card reads as one clickable unit
+            # the way a presenter's mouse expects on a demo screen.
+            def _card_enter(_e, card=card, accent=accent):
+                card.configure(highlightbackground=accent, highlightthickness=2)
+
+            def _card_leave(_e, card=card):
+                card.configure(highlightbackground=BORDER, highlightthickness=1)
+
+            def _open_this(_e, m=mode):
+                self.open(m)
+
+            for widget in (card, *card.winfo_children()):
+                widget.bind("<Enter>", _card_enter)
+                widget.bind("<Leave>", _card_leave)
+                if widget is not button:
+                    # The button already opens via its own command= - only
+                    # bind the rest of the card so a click anywhere on it
+                    # works without double-firing when the button itself
+                    # is clicked.
+                    widget.bind("<Button-1>", _open_this)
 
         tk.Label(self.inner, text="ARGUS PLATFORM", bg=SURFACE, fg="#789095",
                  font=("DejaVu Sans", 8, "bold")).pack(anchor="w", padx=39, pady=(22, 8))
@@ -188,6 +228,8 @@ class ArgusLauncher:
 
 def main():
     root = tk.Tk()
+    root.attributes("-fullscreen", True)
+    root.bind("<Escape>", lambda _e: root.attributes("-fullscreen", False))
     ArgusLauncher(root)
     root.mainloop()
 

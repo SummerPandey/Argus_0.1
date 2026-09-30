@@ -61,16 +61,16 @@ class ChecklistTests(unittest.TestCase):
         self.assertFalse(monitor["armed"])
         self.assertIsNone(monitor["result"])
 
-    def test_missing_checkpoints_lists_soap_by_default(self):
+    def test_missing_checkpoints_lists_foam_by_default(self):
         monitor = reset_monitor()
-        self.assertIn("soap", missing_checkpoints(monitor))
+        self.assertIn("foam", missing_checkpoints(monitor))
 
-    def test_missing_checkpoints_room_mode_never_requires_soap(self):
-        # Room mode excludes soap from the NanoOWL prompt entirely, so
+    def test_missing_checkpoints_room_mode_never_requires_foam(self):
+        # Room mode excludes foam from the NanoOWL prompt entirely, so
         # soap_seen can never become True there — it must not be reported
         # as a missing checkpoint.
         monitor = reset_monitor()
-        self.assertNotIn("soap", missing_checkpoints(monitor, room_mode=True))
+        self.assertNotIn("foam", missing_checkpoints(monitor, room_mode=True))
 
     def test_all_checkpoints_satisfied_leaves_nothing_missing(self):
         self.assertEqual(missing_checkpoints(ReadyMonitor()), [])
