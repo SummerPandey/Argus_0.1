@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "updated": "2026-09-23",
+  "purpose": "Initial source inventory for the Argus soap-and-water handwashing rebuild; not a ready-to-train dataset.",
+  "target_distinct_demonstrations": 15,
+  "training_approved_count": 0,
+  "default_status": {
+    "downloaded": false,
+    "footage_review": "pending",
+    "annotations": "not_started",
+    "reuse_status": "not_reviewed",
+    "training_approved": false,
+    "split": null,
+    "original_performance_group": null
+  },
+  "screening_rules": [
+    "Inspect raw visual actions before approving a source; titles and descriptions do not establish technique coverage.",
+    "Record cut boundaries, unknown intervals, and altered playback speed; edited clips cannot establish full-procedure timing.",
+    "Group translations, reposts, and alternate edits of the same performance before train/validation/test splitting.",
+    "CDC community guidance is not automatically a complete WHO technique demonstration.",
+    "Exclude animation, talking-head-only advice, and alcohol-only or surgical-preparation footage from the initial routine soap-and-water technique dataset.",
+    "Review source reuse conditions and acquisition route before importing media."
+  ],
+  "candidates": [
+    {
+      "id": "who_handwash_2015",
+      "title": "WHO: How to handwash? With soap and water",
+      "publisher": "World Health Organization (WHO)",
+      "url": "https://www.youtube.com/watch?v=3PmVJQUCm4E",
+      "source_page": "https://www.who.int/europe/multi-media/item/who-how-to-handwash-with-soap-and-water",
+      "metadata_evidence": "Official WHO video page and indexed official YouTube publisher/description inspected.",
+      "priority": "high",
+      "candidate_use": "WHO technique demonstration; verify full coverage and hand detail."
+    },
+    {
+      "id": "paho_water_conservation_2020",
+      "title": "Hand washing while conserving water",
+      "publisher": "PAHO/WHO Office of Barbados and the Eastern Caribbean Countries",
+      "url": "https://www.youtube.com/watch?v=-b5hV5PQGv4",
+      "source_page": "https://www.who.int/news-room/feature-stories/detail/paho-who-barbados-video-on-hand-washing-while-saving-water-during-the-pandemic",
+      "metadata_evidence": "Official WHO article describes a 50-second demonstration and links this video.",
+      "priority": "high",
+      "candidate_use": "Potential technique and water-state transitions; visually verify event timing."
+    },
+    {
+      "id": "johns_hopkins_user_reference",
+      "title": "Hand-washing Steps Using the WHO Technique",
+      "publisher": "Johns Hopkins Medicine",
+      "url": "https://www.youtube.com/watch?v=IisgnbMfKvI",
+      "source_page": "https://www.youtube.com/watch?v=IisgnbMfKvI",
+      "metadata_evidence": "User supplied; official publisher and description verified on the YouTube page in the browser.",
+      "priority": "high",
+      "candidate_use": "Requested technique reference; hospital source, not a WHO-channel upload."
+    },
+    {
+      "id": "cdc_fight_germs_2021",
+      "title": "Fight Germs. Wash Your Hands!",
+      "publisher": "Centers for Disease Control and Prevention (CDC)",
+      "url": "https://www.youtube.com/watch?v=eZw4Ga3jg3E",
+      "source_page": "https://www.cdc.gov/clean-hands/communication-resources/index.html",
+      "metadata_evidence": "Official CDC resource listing and indexed official video description inspected.",
+      "priority": "high",
+      "candidate_use": "Community handwashing demonstration; annotate only actually visible actions."
+    },
+    {
+      "id": "cdc_wash_your_hands_2010",
+      "title": "Wash Your Hands",
+      "publisher": "Centers for Disease Control and Prevention (CDC)",
+      "url": "https://www.youtube.com/watch?v=qJG72sycQB8",
+      "source_page": "https://www.cdc.gov/clean-hands/communication-resources/index.html",
+      "metadata_evidence": "Official CDC resource link and indexed official description inspected; direct page fetch failed.",
+      "priority": "medium",
+      "candidate_use": "Potential soap-and-water segments; separate sanitizer content and narration."
+    },
+    {
+      "id": "cdc_what_to_know",
+      "title": "What you need to know about handwashing",
+      "publisher": "Centers for Disease Control and Prevention (CDC)",
+      "url": "https://www.youtube.com/watch?v=fpXh2XHwMmE",
+      "source_page": "https://www.cdc.gov/clean-hands/communication-resources/index.html",
+      "metadata_evidence": "Resolved from the official CDC resource listing.",
+      "priority": "screen_first",
+      "candidate_use": "Determine whether usable demonstrations exist; do not count advice-only footage."
+    },
+    {
+      "id": "cdc_stay_healthy_2020",
+      "title": "Wash Your Hands to Stay Healthy During COVID-19",
+      "publisher": "Centers for Disease Control and Prevention (CDC)",
+      "url": "https://www.youtube.com/watch?v=GQ-zpQEPq_U",
+      "source_page": "https://www.cdc.gov/clean-hands/communication-resources/index.html",
+      "metadata_evidence": "Official CDC resource listing and indexed description inspected; description emphasizes advice from Dr. Schuchat.",
+      "priority": "screen_first",
+      "candidate_use": "Only usable action segments, if any; likely limited technique coverage."
+    },
+    {
+      "id": "cdc_educate_hand_hygiene",
+      "title": "Educate: Developing Knowledge and Skill in Hand Hygiene",
+      "publisher": "Centers for Disease Control and Prevention (CDC)",
+      "url": "https://www.youtube.com/watch?v=XVYn2AoSneA",
+      "source_page": "https://www.youtube.com/watch?v=XVYn2AoSneA",
+      "metadata_evidence": "Title and verified CDC publisher observed in the reference video's related-video list; direct page and footage review pending.",
+      "priority": "screen_first",
+      "candidate_use": "Potential healthcare demonstration segments; filter out alcohol handrub and non-demonstration content."
+    }
+  ],
+  "excluded_or_reference_only": [
+    {
+      "title": "WHO: How to handrub? With alcohol-based formulation",
+      "url": "https://www.youtube.com/watch?v=ZnSjFr6J9HI",
+      "reason": "Alcohol handrub is outside the initial full soap-and-water procedure."
+    },
+    {
+      "title": "Video: Always Wash Your Hands Before, During, and After Preparing Food",
+      "url": "https://www.cdc.gov/food-safety/communication-resources/always-wash-your-hands.html",
+      "reason": "Official page identifies this as a short animation; not real hand-action training footage."
+    }
+  ]
+}
