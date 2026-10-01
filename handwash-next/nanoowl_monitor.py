@@ -56,6 +56,7 @@ from nanoowl_logic import (
     advance_soap_evidence,
     advance_stall_tracking,
     stall_hint,
+    skip_current_step,
 )
 
 # =========================================================
@@ -403,8 +404,6 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         baseline = y + 47 + index * 13
         _status_dot(frame, (x + 13, baseline - 3), complete)
         label(text, x + 24, baseline, TEXT_BRIGHT if complete else TEXT_MUTED)
-        if key:
-            label(key, x + width - 17, baseline, TEXT_FAINT, 0.27)
 
     label(f"Rub {monitor['rubbing_time']:.1f}/{REQUIRED_RUB_TIME:.0f}s",
           x + 9, y + 140, scale=0.29)
@@ -432,7 +431,7 @@ def draw_checklist(frame, monitor, separation_elapsed, current_time):
         guidance = "Next: " + (remaining[0] if remaining else f"finish {MINIMUM_WASH_TIME:.0f}s procedure")
         color = CYAN
     else:
-        guidance = "W/N/D/F: manual steps" if ROOM_MODE else "Auto steps | W/N/D/F if missed"
+        guidance = "S to skip step" if not monitor["rubbing_confirmed"] else "S to skip remaining steps"
         color = TEXT_FAINT
     label(guidance, x + 9, y + 163, color, 0.28)
     label("R reset   C calibrate   Q quit", x + 9, y + 177, TEXT_FAINT, 0.27)
@@ -1303,51 +1302,14 @@ def main():
 
                 print("Monitor reset.")
 
-            # W/N/D/F are a manual FALLBACK only. Wet/rinse/dry/faucet-closed
-            # are normally auto-detected from water/towel/faucet evidence
-            # above; these keys exist so a session isn't stuck if detection
-            # misses on-device (lighting, camera angle, etc).
-            if (
-                key == ord("w")
-                and monitor["result"] is None
-                and monitor["armed"]
-                and not monitor["rubbing_confirmed"]
-                and not monitor["wet_confirmed"]
-            ):
-                monitor["wet_confirmed"] = True
-                if not ROOM_MODE:
-                    # WHO step 1: this is when the timed 40-60s procedure
-                    # actually begins, not whenever hands first appeared.
-                    monitor["started_at"] = current_time
-                print("Manual fallback: hands wetted.")
-
-            if (
-                key == ord("n")
-                and monitor["result"] is None
-                and monitor["rubbing_time"] >= REQUIRED_RUB_TIME
-                and (ROOM_MODE or monitor["soap_seen"])
-                and not monitor["rinse_confirmed"]
-            ):
-                monitor["rinse_confirmed"] = True
-                print("Manual fallback: hands rinsed.")
-
-            if (
-                key == ord("d")
-                and monitor["result"] is None
-                and monitor["rinse_confirmed"]
-                and not monitor["dry_confirmed"]
-            ):
-                monitor["dry_confirmed"] = True
-                print("Manual fallback: single-use towel drying.")
-
-            if (
-                key == ord("f")
-                and monitor["result"] is None
-                and monitor["dry_confirmed"]
-                and not monitor["faucet_confirmed"]
-            ):
-                monitor["faucet_confirmed"] = True
-                print("Manual fallback: faucet closed with towel.")
+            # S: universal skip button. Wet/rinse/dry/faucet-closed are
+            # normally auto-detected from water/towel/faucet evidence above;
+            # this key exists so a session isn't stuck if detection misses
+            # on-device (lighting, camera angle, etc).
+            if key == ord("s") and monitor["result"] is None:
+                step = skip_current_step(monitor, current_time, ROOM_MODE)
+                if step:
+                    print(f"Manual skip: {step}.")
 
             # =====================================================
             # AUTOMATIC RESET AFTER RESULT

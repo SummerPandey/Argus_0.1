@@ -479,6 +479,59 @@ def stall_hint(monitor, now):
     )
 
 
+def skip_current_step(monitor, current_time, room_mode=False):
+    """Universal skip: advance to the next incomplete step in the WHO sequence.
+    Returns the step name if a skip was performed, None if workflow is complete."""
+    # Check all steps in order and skip the first incomplete one
+    if monitor["result"] is not None:
+        return None
+
+    # Ensure started_at is set (normally set when armed in room mode, or when wet
+    # is confirmed in non-room mode). Backdate it so elapsed time calculation passes
+    # when all steps are skipped quickly.
+    if monitor["started_at"] is None:
+        monitor["started_at"] = current_time - MINIMUM_WASH_TIME
+
+    # WHO step 1: Wet hands
+    if not monitor["wet_confirmed"]:
+        monitor["wet_confirmed"] = True
+        return "wet hands"
+
+    # WHO step 2: Foam/Soap (can be bypassed in room mode)
+    if not room_mode and not monitor["soap_seen"]:
+        monitor["soap_seen"] = True
+        return "foam observed"
+
+    # WHO steps 3-8: Rubbing (auto-detected after 5s, but can skip to mark confirmed)
+    if not monitor["rubbing_confirmed"]:
+        monitor["rubbing_confirmed"] = True
+        monitor["confirmation_time"] = INITIAL_CONFIRMATION_TIME
+        monitor["rubbing_time"] = INITIAL_CONFIRMATION_TIME
+        return "rubbing confirmed"
+
+    # Fast-track remaining rubbing time if needed
+    if monitor["rubbing_time"] < REQUIRED_RUB_TIME:
+        monitor["rubbing_time"] = REQUIRED_RUB_TIME
+        return "active rubbing"
+
+    # WHO step 9: Rinse
+    if not monitor["rinse_confirmed"]:
+        monitor["rinse_confirmed"] = True
+        return "rinse"
+
+    # WHO step 10: Dry with towel
+    if not monitor["dry_confirmed"]:
+        monitor["dry_confirmed"] = True
+        return "single-use towel"
+
+    # WHO step 11: Tap closed with towel
+    if not monitor["faucet_confirmed"]:
+        monitor["faucet_confirmed"] = True
+        return "tap closed with towel"
+
+    return None
+
+
 def reset_monitor():
     return {
         "state": "WAITING",

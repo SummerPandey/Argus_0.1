@@ -31,6 +31,7 @@ from nanoowl_logic import (
     motion_ratio,
     procedure_elapsed,
     reset_monitor,
+    skip_current_step,
     stall_hint,
     strongest_by_side,
     technique_prompt,
@@ -438,6 +439,155 @@ class LoadConfigTests(unittest.TestCase):
             path.write_text(json.dumps([1, 2, 3]))
             applied = load_config(path=path)
         self.assertEqual(applied, {})
+
+
+class UniversalSkipTests(unittest.TestCase):
+    def test_skip_wet_hands_first(self):
+        from nanoowl_logic import skip_current_step, MINIMUM_WASH_TIME
+        monitor = reset_monitor()
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "wet hands")
+        self.assertTrue(monitor["wet_confirmed"])
+        # When skipping, started_at is backdated so elapsed time calculation passes
+        self.assertEqual(monitor["started_at"], current_time - MINIMUM_WASH_TIME)
+
+    def test_skip_foam_after_wet(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "foam observed")
+        self.assertTrue(monitor["soap_seen"])
+
+    def test_skip_rubbing_after_foam(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "rubbing confirmed")
+        self.assertTrue(monitor["rubbing_confirmed"])
+
+    def test_skip_active_rubbing_to_required_time(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        monitor["rubbing_confirmed"] = True
+        monitor["rubbing_time"] = 10.0
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "active rubbing")
+        self.assertEqual(monitor["rubbing_time"], REQUIRED_RUB_TIME)
+
+    def test_skip_rinse_after_rubbing_complete(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        monitor["rubbing_confirmed"] = True
+        monitor["rubbing_time"] = REQUIRED_RUB_TIME
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "rinse")
+        self.assertTrue(monitor["rinse_confirmed"])
+
+    def test_skip_dry_after_rinse(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        monitor["rubbing_confirmed"] = True
+        monitor["rubbing_time"] = REQUIRED_RUB_TIME
+        monitor["rinse_confirmed"] = True
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "single-use towel")
+        self.assertTrue(monitor["dry_confirmed"])
+
+    def test_skip_faucet_after_dry(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        monitor["rubbing_confirmed"] = True
+        monitor["rubbing_time"] = REQUIRED_RUB_TIME
+        monitor["rinse_confirmed"] = True
+        monitor["dry_confirmed"] = True
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertEqual(result, "tap closed with towel")
+        self.assertTrue(monitor["faucet_confirmed"])
+
+    def test_no_skip_when_all_complete(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["wet_confirmed"] = True
+        monitor["soap_seen"] = True
+        monitor["rubbing_confirmed"] = True
+        monitor["rubbing_time"] = REQUIRED_RUB_TIME
+        monitor["rinse_confirmed"] = True
+        monitor["dry_confirmed"] = True
+        monitor["faucet_confirmed"] = True
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertIsNone(result)
+
+    def test_skip_bypasses_foam_in_room_mode(self):
+        from nanoowl_logic import skip_current_step, MINIMUM_WASH_TIME
+        monitor = reset_monitor()
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=True)
+        self.assertEqual(result, "wet hands")
+        self.assertTrue(monitor["wet_confirmed"])
+        # In room mode, started_at is set when we first skip (backdated)
+        self.assertEqual(monitor["started_at"], current_time - MINIMUM_WASH_TIME)
+
+        # Next skip should go to rubbing, not foam
+        result = skip_current_step(monitor, current_time, room_mode=True)
+        self.assertEqual(result, "rubbing confirmed")
+        self.assertTrue(monitor["rubbing_confirmed"])
+
+    def test_skip_returns_none_when_result_set(self):
+        from nanoowl_logic import skip_current_step
+        monitor = reset_monitor()
+        monitor["result"] = "CORRECT"
+        current_time = 100.0
+        result = skip_current_step(monitor, current_time, room_mode=False)
+        self.assertIsNone(result)
+
+    def test_skipping_all_steps_completes_sequence(self):
+        from nanoowl_logic import skip_current_step, missing_checkpoints
+        monitor = reset_monitor()
+        current_time = 100.0
+
+        # Skip through all steps
+        skip_current_step(monitor, current_time, room_mode=False)  # wet
+        skip_current_step(monitor, current_time, room_mode=False)  # foam
+        skip_current_step(monitor, current_time, room_mode=False)  # rubbing
+        skip_current_step(monitor, current_time, room_mode=False)  # active rubbing
+        skip_current_step(monitor, current_time, room_mode=False)  # rinse
+        skip_current_step(monitor, current_time, room_mode=False)  # dry
+        skip_current_step(monitor, current_time, room_mode=False)  # faucet
+
+        # Verify all steps are confirmed
+        self.assertTrue(monitor["wet_confirmed"])
+        self.assertTrue(monitor["soap_seen"])
+        self.assertTrue(monitor["rubbing_confirmed"])
+        self.assertEqual(monitor["rubbing_time"], REQUIRED_RUB_TIME)
+        self.assertTrue(monitor["rinse_confirmed"])
+        self.assertTrue(monitor["dry_confirmed"])
+        self.assertTrue(monitor["faucet_confirmed"])
+
+        # Verify no missing checkpoints
+        missing = missing_checkpoints(monitor, room_mode=False)
+        self.assertEqual(missing, [])
+
+        # Verify started_at is set for elapsed time calculation
+        self.assertIsNotNone(monitor["started_at"])
 
 
 if __name__ == "__main__":
